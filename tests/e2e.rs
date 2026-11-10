@@ -100,7 +100,7 @@ fn feature_variants_of_workspace_member_coexist() {
     }
     assert_eq!(ws.run_all(cmds), 0);
     ws.assert_clean(cmds);
-    assert_eq!(ws.pins(), 0, "told apart by features, no pin needed");
+    assert!(ws.pins() > 0, "alternating feature variants are pinned");
 }
 
 #[test]
@@ -418,7 +418,9 @@ fn rustflags_change() {
     }
     let (a, b) = (inventory(&ws.target), inventory(&oracle));
     let lost: Vec<_> = b.difference(&a).collect();
+    let left: Vec<_> = a.difference(&b).collect();
     assert!(lost.is_empty(), "{lost:#?}");
+    assert!(left.is_empty(), "builds without the flags are superseded: {left:#?}");
     for c in cmds {
         assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &env), 0);
     }
@@ -672,6 +674,10 @@ fn background_failure_leaves_a_notice() {
         .output()
         .unwrap();
     assert!(out.status.success());
+    assert!(
+        !bogus.join(".autoprune").exists(),
+        "wrote state into a non-cargo dir"
+    );
     // nothing to report there (no state dir can be trusted), but a real profile reports errors:
     let debug = ws.target.join("debug");
     let deps = debug.join("deps");

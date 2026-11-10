@@ -1,6 +1,6 @@
 //! The `rustc-wrapper` hot path: tag clippy units, maybe spawn a background prune, exec rustc.
 
-use crate::layout::{has_cargo_lock, STATE_DIR, TAGS_DIR, UNITS_FILE};
+use crate::layout::{has_cargo_lock, is_profile_dir, STATE_DIR, TAGS_DIR, UNITS_FILE};
 use crate::prune::{env_secs, prune, Config, Outcome};
 use crate::state::{add_notice, notices_for, read_notices, NOTICE_FILE};
 use std::env;
@@ -192,6 +192,7 @@ pub fn background(profile: Option<PathBuf>) {
     let notices = match prune(&profile, &Config::from_env()) {
         Ok(Outcome::Done(r)) => notices_for(&profile, &r),
         Ok(Outcome::Busy) => Vec::new(), // another prune runs, or cargo kept the lock for an hour
+        Err(_) if !is_profile_dir(&profile) => return, // not a cargo dir: write nothing there
         Err(e) => vec![format!(
             "background prune of {} failed: {e}",
             profile.display()

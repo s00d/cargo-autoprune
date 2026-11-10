@@ -44,6 +44,7 @@ impl Ws {
         let v = ws.root.join("vendor");
         vendor(&v, "dep_a", "1.0.0", "", "pub fn a() -> u32 { 100 }");
         vendor(&v, "dep_a", "1.1.0", "", "pub fn a() -> u32 { 110 }");
+        vendor(&v, "dep_a", "2.0.0", "", "pub fn a() -> u32 { 200 }");
         vendor(
             &v,
             "dep_b",

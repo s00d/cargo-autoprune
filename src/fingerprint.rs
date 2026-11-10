@@ -166,13 +166,23 @@ pub(crate) fn parse_fingerprint_json(s: &str) -> (u64, Vec<u64>) {
     (rustc, deps)
 }
 
-/// What makes two builds of the same workspace package legitimately different: everything in the
-/// json except `deps` and `local` (they embed the unit hash). `path` (source path hash) keeps
-/// same-named packages of different workspaces sharing one target dir apart.
+/// What lets two builds of one workspace package be live *at the same time*: the target, the
+/// profile (a build-dependency gets `build-override`), host vs target (`compile_kind`) and the
+/// source path. Features, rustflags and config are left out on purpose: a change there (an edit
+/// of `[features]` or `[profile]`, another `RUSTFLAGS`) supersedes the old build, and variants
+/// that really alternate (`-p x --features y`) are caught by the comeback pin instead.
 pub(crate) fn json_signature(s: &str) -> String {
-    let head = s.split("\"deps\":").next().unwrap_or("");
-    let tail = s.split_once("\"rustflags\":").map_or("", |(_, t)| t);
-    format!("{head}{tail}")
+    let field = |k: &str| {
+        s.split_once(&format!("\"{k}\":"))
+            .map_or("", |(_, r)| r.split([',', '}']).next().unwrap_or(""))
+    };
+    format!(
+        "t={} p={} path={} ck={}",
+        field("target"),
+        field("profile"),
+        field("path"),
+        field("compile_kind")
+    )
 }
 
 /// Cargo writes fingerprint values as hex of the little-endian bytes.
@@ -203,6 +213,18 @@ mod tests {
             Some("/a b/lib.rs")
         );
         assert_eq!(first_dependency("/t/x:"), None);
+    }
+
+    #[test]
+    fn signature_keeps_profile_and_kind_but_not_features() {
+        let a = r#"{"rustc":1,"features":"[\"x\"]","declared_features":"[]","target":5,"profile":7,"path":9,"deps":[],"local":[],"rustflags":["-Cfoo"],"config":3,"compile_kind":0}"#;
+        let b = r#"{"rustc":1,"features":"[]","declared_features":"[\"y\"]","target":5,"profile":7,"path":9,"deps":[[1,"d",false,2]],"local":[],"rustflags":[],"config":4,"compile_kind":0}"#;
+        assert_eq!(json_signature(a), json_signature(b));
+        assert_eq!(json_signature(a), "t=5 p=7 path=9 ck=0");
+        assert_ne!(
+            json_signature(a),
+            json_signature(&a.replace("\"profile\":7", "\"profile\":8"))
+        );
     }
 
     #[test]

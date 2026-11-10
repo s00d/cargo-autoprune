@@ -26,6 +26,8 @@ use std::time::{Duration, SystemTime};
 
 /// A rustc hash not used for this long (relative to the newest unit) is an old toolchain.
 const RUSTC_RETIRE: Duration = Duration::from_secs(14 * 24 * 3600);
+/// A profile/host variant of a package not rebuilt for this long while the package was.
+const VARIANT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 pub(crate) struct Candidate {
     /// Why it is deleted (report breakdown): orphan, superseded, unreachable, removed target,
@@ -121,15 +123,27 @@ pub(crate) fn plan(
     // Dedup workspace units (all units when locality is unknown).
     let mut roots: Vec<u64> = extra_roots;
     let mut kept_local = Vec::new();
+    // A family is a group without its signature: one package/kind built with another profile or
+    // for the host. A variant not rebuilt for VARIANT_TTL while its family was is dead.
+    let family = |key: &str| key.rsplit_once('|').map_or(key, |(f, _)| f).to_owned();
+    let mut family_newest: HashMap<String, SystemTime> = HashMap::new();
+    for (key, members) in &groups {
+        if let Some(t) = members.iter().filter_map(|(c, ..)| c.mtime).max() {
+            let e = family_newest.entry(family(key)).or_insert(t);
+            *e = (*e).max(t);
+        }
+    }
     for (key, members) in groups {
         let newest = members.iter().filter_map(|(c, ..)| c.mtime).max();
+        let dead_variant = match (newest, family_newest.get(&family(&key))) {
+            (Some(n), Some(&f)) => n + VARIANT_TTL < f,
+            _ => false,
+        };
         for (c, deps, is_run, dep_info) in members {
             let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n);
-            if stale && !pinned.contains_key(&key) {
-                doomed.push(Candidate {
-                    reason: "superseded",
-                    ..c
-                });
+            if (stale || dead_variant) && !pinned.contains_key(&key) {
+                let reason = if stale { "superseded" } else { "stale variant" };
+                doomed.push(Candidate { reason, ..c });
             } else {
                 kept_local.push((c, deps, is_run, dep_info));
             }
@@ -213,8 +227,14 @@ pub(crate) fn plan(
     let mut keep_dir: Vec<Option<bool>> = vec![None; incremental.len()];
     let mut claimed: HashSet<&str> = HashSet::new();
     for (k, (_, _, _, inodes)) in incremental.iter().enumerate() {
-        if let Some(&(id, is_doomed)) = inodes.iter().find_map(|i| owner.get(i)) {
-            keep_dir[k] = Some(!is_doomed);
+        // one dir can hold sessions of an old and a new unit (same `-C metadata`, e.g. after a
+        // RUSTFLAGS change): any live owner keeps it
+        let owners: Vec<(&str, bool)> = inodes
+            .iter()
+            .filter_map(|i| owner.get(i).copied())
+            .collect();
+        if let Some(&(id, _)) = owners.iter().find(|(_, d)| !d).or(owners.first()) {
+            keep_dir[k] = Some(owners.iter().any(|(_, d)| !d));
             claimed.insert(id);
         }
     }

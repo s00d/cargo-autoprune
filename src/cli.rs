@@ -55,10 +55,45 @@ fn resolve_profiles(dir: Option<PathBuf>) -> Vec<PathBuf> {
     profiles
 }
 
+/// A size cap from the user. Tiny values are refused: `--max-size 20` (bytes, meant 20G) would
+/// delete every unit.
+pub(crate) fn parse_cap(v: &str) -> Result<u64, String> {
+    match parse_size(v) {
+        Some(b) if b >= 1 << 20 => Ok(b),
+        Some(_) => Err(format!(
+            "size cap {v:?} is below 1 MiB; use a unit, e.g. 20G"
+        )),
+        None => Err(format!("cannot parse size {v:?}; use e.g. 500M or 20G")),
+    }
+}
+
+/// Environment settings that do not parse, so `status` can say they are ignored.
+fn bad_env() -> Vec<String> {
+    let mut out = Vec::new();
+    for k in ["CARGO_AUTOPRUNE_INTERVAL", "CARGO_AUTOPRUNE_GRACE"] {
+        if let Ok(v) = env::var(k) {
+            if v.trim().parse::<u64>().is_err() {
+                out.push(format!(
+                    "{k}={v:?} is not a number of seconds; the default is used"
+                ));
+            }
+        }
+    }
+    if let Ok(v) = env::var("CARGO_AUTOPRUNE_MAX_SIZE") {
+        if let Err(e) = parse_cap(&v) {
+            out.push(format!("CARGO_AUTOPRUNE_MAX_SIZE ignored: {e}"));
+        }
+    }
+    out
+}
+
 /// `cargo autoprune status [DIR]`: size, reclaimable space, last prune, pins, notices, setup.
 fn status(dir: Option<PathBuf>) {
     let wrapper = configured_wrapper();
     println!("wrapper: {}", wrapper.as_deref().unwrap_or("not configured (add build.rustc-wrapper = \"cargo-autoprune\" to ~/.cargo/config.toml)"));
+    for w in bad_env() {
+        println!("warning: {w}");
+    }
     let dry = Config {
         dry_run: true,
         lock_wait: Duration::ZERO,
@@ -173,10 +208,16 @@ pub fn run(args: &[OsString]) {
             }
             "-n" | "--dry-run" => cfg.dry_run = true,
             "-v" | "--verbose" => verbose = true,
-            "--max-size" => cfg.max_size = it.next().and_then(|s| parse_size(&s)),
+            "--max-size" => {
+                let v = it.next().unwrap_or_default();
+                cfg.max_size = Some(parse_cap(&v).unwrap_or_else(|e| die(&e)));
+            }
             "--grace" => {
-                cfg.grace =
-                    Duration::from_secs(it.next().and_then(|s| s.parse().ok()).unwrap_or(600))
+                let v = it.next().unwrap_or_default();
+                let secs = v
+                    .parse()
+                    .unwrap_or_else(|_| die(&format!("--grace takes seconds, got {v:?}")));
+                cfg.grace = Duration::from_secs(secs);
             }
             _ if a.starts_with('-') => die(&format!("unknown option {a}\n\n{HELP}")),
             _ => dir = Some(PathBuf::from(a)),
@@ -240,4 +281,16 @@ pub fn run(args: &[OsString]) {
 fn die(msg: &str) -> ! {
     eprintln!("cargo-autoprune: {msg}");
     std::process::exit(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caps_need_a_sane_size() {
+        assert_eq!(parse_cap("20G"), Ok(20 << 30));
+        assert!(parse_cap("20").unwrap_err().contains("below 1 MiB"));
+        assert!(parse_cap("lots").unwrap_err().contains("cannot parse"));
+    }
 }

@@ -420,7 +420,10 @@ fn rustflags_change() {
     let lost: Vec<_> = b.difference(&a).collect();
     let left: Vec<_> = a.difference(&b).collect();
     assert!(lost.is_empty(), "{lost:#?}");
-    assert!(left.is_empty(), "builds without the flags are superseded: {left:#?}");
+    assert!(
+        left.is_empty(),
+        "builds without the flags are superseded: {left:#?}"
+    );
     for c in cmds {
         assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &env), 0);
     }

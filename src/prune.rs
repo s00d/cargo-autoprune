@@ -32,7 +32,7 @@ impl Config {
             grace: env_secs("CARGO_AUTOPRUNE_GRACE", d.grace.as_secs()),
             max_size: std::env::var("CARGO_AUTOPRUNE_MAX_SIZE")
                 .ok()
-                .and_then(|s| crate::parse_size(&s)),
+                .and_then(|s| crate::cli::parse_cap(&s).ok()),
             ..d
         }
     }

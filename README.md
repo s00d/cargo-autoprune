@@ -25,7 +25,19 @@ That is all. Every project you build cleans itself.
 - **Chain another wrapper** (sccache etc.): set `CARGO_AUTOPRUNE_WRAPPER=sccache` (in the shell, or in
   `[env]` of the config) instead of putting it in `rustc-wrapper`.
 - **Disable**: remove the line, or set `CARGO_AUTOPRUNE=0` (the wrapper stays a transparent pass-through).
-- **Manual run / preview**: `cargo autoprune --dry-run [DIR]`, `cargo autoprune [--max-size 20G] [DIR]`.
+- **Manual run / preview**: `cargo autoprune --dry-run [DIR]`, `cargo autoprune [--max-size 20G] [-v] [DIR]`.
+- **What is going on**: `cargo autoprune status [DIR]` shows, per profile dir:
+  - size on disk and what is reclaimable right now, by reason
+  - the last prune
+  - pinned groups and pending notices
+  - whether the wrapper is configured, and settings in the environment that don't parse
+
+```text
+wrapper: enabled in /Users/me/.cargo/config.toml
+./target/debug: 388.0MiB on disk, 15 units
+  reclaimable now: 80.6MiB (5 units, 5 incremental dirs: stale incremental 5, superseded 5)
+  last prune: 46 min ago, units=5 incremental=5 freed=80.6MiB ... [superseded 5, stale incremental 5]
+```
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -34,6 +46,20 @@ That is all. Every project you build cleans itself.
 | `CARGO_AUTOPRUNE_GRACE` | `600` | Copies built within this many seconds of the newest copy are kept |
 | `CARGO_AUTOPRUNE_MAX_SIZE` | none | Size cap per profile dir, e.g. `20G`. The oldest units go first |
 | `CARGO_AUTOPRUNE_WRAPPER` | none | Wrapper to run instead of plain rustc, e.g. `sccache` |
+| `CARGO_AUTOPRUNE_QUIET` | off | `1` silences the terminal notices |
+| `CARGO_AUTOPRUNE_TRACE` | off | `1` prints phase timings of manual runs (`-v` does the same) |
+
+**Notices.** The background prune never prints during a build. It saves a notice when something is
+worth knowing:
+
+- a prune failed, or paths could not be deleted
+- it freed 1 GiB or more
+- it held cargo's lock for 5 s or more (the first cleanup of a huge target)
+
+The next build prints those once on the terminal (`/dev/tty`), as
+`warning: cargo-autoprune: freed 3.2GiB in target/debug (superseded 12, unreachable 40)`.
+They don't go to stderr because cargo stores a crate's stderr and replays it on every later build
+of that crate. Without a terminal (IDE, CI) the notices stay for `cargo autoprune status`.
 
 ## How it works
 
@@ -47,7 +73,16 @@ That is all. Every project you build cleans itself.
    `.cargo-build-lock`, `.cargo-artifact-lock`). It takes all of them or none, so it can't deadlock with
    Cargo. It waits until the running build finishes and holds the locks while it deletes, so no Cargo
    build can start meanwhile. A second pruner exits at once.
-4. **Prune.** It runs in tens of milliseconds on small targets.
+4. **Prune.**
+   - The scan takes no `stat` per file in `deps/`: names, file types and inodes come from `readdir`.
+   - Fingerprints and incremental sessions are read on several threads.
+   - While the lock is held, files are unlinked and whole directories are moved into
+     `.autoprune/trash` with one rename each. The directories' contents are deleted after the lock
+     is released.
+   - Small targets take a few milliseconds (see Measurements).
+5. **Bookkeeping in the wrapper.** For crates of path packages, the wrapper appends
+   `<unit hash>\t<package dir>` to `.autoprune/units`. For clippy builds it writes a tag file. Both
+   are single appends, and they are why shared target dirs and `build.build-dir` work (see below).
 
 ## What gets deleted
 
@@ -58,7 +93,8 @@ A *unit* is everything with one metadata hash `H`: `.fingerprint/<pkg>-H/`, `bui
 |---|---|
 | Units with no fingerprint (orphans, e.g. `.o`/`.d` left after an executable was deleted) | Always. Cargo can never consider them fresh |
 | Units of removed or renamed targets (bin, test, example, build script) | The crate root named first in the unit's rustc dep-info file no longer exists. A build-script run goes with its compiled build script |
-| Superseded workspace units | Group by package + target kind (lib, test, bin, example, build-script compile/run) + outputs (`rlib` or `check` rmeta) + fingerprint json signature (features, profile, rustflags, config, target) + rustc hash + clippy tag. In each group, delete copies older than the newest by more than the grace period |
+| Superseded workspace units | Grouped by package, target kind (lib, test, bin, example, build-script compile/run), outputs (`rlib` or `check` rmeta), profile, host/target, rustc hash, clippy tag and workspace. In each group, copies older than the newest by more than the grace period go. Features, `RUSTFLAGS` and config are *not* part of the group: a change there supersedes the old build |
+| Stale variants | A profile or host variant of a package that hasn't been rebuilt for 7 days while the package has |
 | Registry/git units | Kept only while a kept workspace unit depends on them, transitively, through the `deps` edges in `.fingerprint/*/*.json`. Edges from the other profile dirs of the same target count too, because with `--target` the build scripts and proc-macros live in the host profile. Removed dependencies, old versions and old feature sets go automatically. A removed workspace member is no longer in `Cargo.lock`, so it is treated the same way |
 | Old toolchains | A rustc hash with no writes for 14 days before the newest unit is dropped |
 | `incremental/<crate>-<id>/` | Follows its unit. The session's work products are hard links to the unit's `.rmeta` / `.rcgu.o` in `deps/`, so the inode identifies the owner. Without a shared inode (Linux deletes a binary's objects), units and dirs of the crate are paired one-to-one, closest mtime first. Dirs left without a unit are deleted |
@@ -73,8 +109,9 @@ never a broken build.
 
 - `clippy` units have the same json as `check` units. The wrapper tags units compiled while
   `RUSTC_WORKSPACE_WRAPPER` is set, a file write that happens only under clippy.
-- `cargo build -p x` and `cargo build --workspace` resolve features differently, so the same crate is
-  built against different dependencies.
+- `cargo build -p x --features y`, or `-p x` vs `--workspace` with different feature unification,
+  builds a crate in two live variants. An edit of `[features]` produces the same picture, but there
+  the old build is dead.
 
 For the second case only timing helps. The pruner remembers deletions for 24 hours. A deleted unit
 that gets rebuilt is a *comeback*:
@@ -87,12 +124,22 @@ that gets rebuilt is a *comeback*:
 Alternating variants therefore cost one extra rebuild before the pin. Toggling a dependency back and
 forth twice looks the same as alternation and also pins.
 
-State lives in `<profile>/.autoprune/` (`stamp`, `log`, `deleted`, `suspects`, `pinned`, `tags/`).
-Each prune appends one line to `log`.
+State lives in `<profile>/.autoprune/`: `stamp`, `log`, `deleted`, `suspects`, `pinned`, `tags/`,
+`units`, `notice`. Each prune appends one line to `log`, with counts per reason.
 
-**Locality** (workspace or registry) comes from the `Cargo.lock` next to `target/`. With a shared
-`CARGO_TARGET_DIR` there is no such file. Then every unit falls back to group deduplication, which
-still removes superseded copies but keeps removed dependencies until the size cap evicts them.
+**Locality** (workspace or registry) comes from `Cargo.lock` files:
+
+- the one next to `target/`;
+- the workspaces of the package dirs that the wrapper recorded.
+
+This covers:
+
+- a shared `CARGO_TARGET_DIR`, where several workspaces with same-named packages stay apart;
+- a separate `build.build-dir`, where the profile dirs have only `.cargo-build-lock`.
+
+With no lock file found at all (only units built before the wrapper was installed), every unit falls
+back to group deduplication. That still removes superseded copies, but keeps removed dependencies
+until the size cap evicts them.
 
 ## Comparison
 
@@ -160,15 +207,37 @@ with the wrapper. The result is compared with an *oracle*: the same commands in 
 Step 10 is the second comeback, so those groups are pinned for 24 hours (see above). Without the
 pruner, every step keeps all of its copies.
 
-**Speed.** Wrapper overhead is 2.8 ms per compiled crate: 1000 calls take 5.3 s instead of 2.5 s.
-That is one extra `exec`, while rustc takes 100 ms to minutes per crate. A background prune scans a
-profile dir with 126,000 files (2,000 units) in 0.7 s warm and 1.8 s cold, and a small dir in
-5–50 ms. The prune runs after the build, while Cargo's lock is held for that short time.
+**Speed.**
+
+- **Wrapper.** 2.8 ms per compiled crate, the same as a minimal C `execv` wrapper (4.7–5.5 ms per
+  call vs 2.4–2.7 ms for the bare program in the same loop). The cost is the second `exec` on macOS;
+  the wrapper's own work (a few `stat`s) is noise. rustc itself takes 100 ms to minutes per crate.
+- **Prune.** Measured on a generated target (`scripts/bench-tree.py`) with 52,000 files:
+  - 2,400 units: 150 workspace packages, each with a current and a superseded copy, plus 600
+    registry crates;
+  - test executables with 50 objects each;
+  - incremental sessions hard-linked to `deps/`.
+
+  Warm cache, release build:
+
+| Phase | First version | Now |
+|---|---|---|
+| scan `.fingerprint` (2,400 dirs) | 200 ms | 83 ms (threads) |
+| scan `deps` (32,000 files) | 210 ms | 23 ms (no `stat`, inodes from `readdir`) |
+| scan incremental | 145 ms | 23 ms |
+| plan | 25 ms | 11 ms (dep-info read only for kept units, on threads) |
+| cargo blocked, dry run | 770 ms | 140 ms |
+| cargo blocked, deleting 1,197 units / 10,000 files | 5–6.7 s (trash renames) | 1.0–1.7 s (unlink files, rename dirs) |
+
+  The deletion is bound by APFS: about 0.1 ms per unlink in a directory of 32,000 entries,
+  serialized per directory, so more threads don't help. A normal prune after a dependency bump
+  deletes tens to hundreds of files and blocks cargo for a few milliseconds.
 
 ## Tests
 
 ```bash
-cargo test                      # 26 unit tests + 20 end-to-end tests with real cargo
+cargo test                      # 30 unit tests + 32 end-to-end tests with real cargo
+python3 scripts/bench-tree.py /tmp/bench && CARGO_AUTOPRUNE_TRACE=1 cargo autoprune --dry-run /tmp/bench
 scripts/self-test.sh            # self-cleaning on this crate
 scripts/churn-test.sh           # real crates.io crates vs oracle (needs them in ~/.cargo/registry)
 ```
@@ -194,6 +263,17 @@ Scenarios covered:
 - A removed workspace member and a renamed binary
 - A toolchain switch (another installed toolchain), and its retirement after 3 simulated weeks
 - Orphaned objects, the size cap, a shared target without `Cargo.lock`
+- Two workspaces with same-named packages in one target dir, and a separate `build.build-dir`
+- Dependency kinds (`tests/deps.rs`):
+  - two major versions side by side
+  - dev and build dependencies
+  - an optional dependency behind a feature
+  - a `cfg(...)` target dependency
+  - a path dependency outside the workspace
+  - `[patch.crates-io]`
+  - `workspace = true` inheritance
+  - a git dependency (a local repo, new commit)
+- Notices for failed deletions, the status command, `cargo-autoprune DIR` without a subcommand
 - The background prune waiting for a running build
 - The wrapper being transparent: version probes, chaining, compile errors
 - CLI `--dry-run`
@@ -204,8 +284,10 @@ Source layout: `wrapper.rs` (hot path), `cli.rs`, `prune.rs` (one pass), `scan.r
 
 ## Limitations
 
-- Windows: builds and spawns detached, but untested.
-- Units of a second workspace that shares one target dir through `CARGO_TARGET_DIR` count as
-  registry units. Without a `Cargo.lock` next to the target, everything falls back to group
-  deduplication.
+- Windows builds and spawns detached, but is untested, and notices are not printed there (no `/dev/tty`).
 - Uplifted outputs of a renamed or removed binary (`target/debug/oldname`) are not removed.
+- The first prune of a huge, never-pruned target (tens of thousands of stale files) can hold cargo's
+  lock for several seconds, which is reported as a notice. Later prunes are small.
+- Units built before the wrapper was installed carry no workspace record. In a shared target dir,
+  same-named packages of different workspaces can evict each other once, until they are rebuilt
+  through the wrapper.

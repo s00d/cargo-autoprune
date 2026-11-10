@@ -13,8 +13,11 @@ const STAMP: &str = ".autoprune/stamp";
 const DEFAULT_INTERVAL: u64 = 300;
 
 pub fn run_wrapper(args: Vec<OsString>) -> ! {
-    if env::var_os("CARGO_AUTOPRUNE").is_none_or(|v| v != "0") {
-        maybe_trigger(&args);
+    if let Some(profile) = out_dir(&args).as_deref().and_then(profile_of) {
+        tag_workspace_wrapper(&args, &profile); // needed even with the background prune off
+        if env::var_os("CARGO_AUTOPRUNE").is_none_or(|v| v != "0") {
+            maybe_trigger(&profile);
+        }
     }
     let mut cmd = match env::var_os("CARGO_AUTOPRUNE_WRAPPER").filter(|w| !w.is_empty()) {
         Some(w) => {
@@ -115,11 +118,7 @@ fn tag_workspace_wrapper(args: &[OsString], profile: &Path) {
     }
 }
 
-fn maybe_trigger(args: &[OsString]) {
-    let Some(profile) = out_dir(args).as_deref().and_then(profile_of) else {
-        return;
-    };
-    tag_workspace_wrapper(args, &profile);
+fn maybe_trigger(profile: &Path) {
     let stamp = profile.join(STAMP);
     let interval = env_secs("CARGO_AUTOPRUNE_INTERVAL", DEFAULT_INTERVAL);
     let fresh = std::fs::metadata(&stamp)
@@ -130,14 +129,14 @@ fn maybe_trigger(args: &[OsString]) {
     if fresh {
         return;
     }
-    let _ = std::fs::create_dir_all(stamp.parent().unwrap_or(&profile));
+    let _ = std::fs::create_dir_all(stamp.parent().unwrap_or(profile));
     if File::create(&stamp).is_err() {
         return;
     }
     let Ok(me) = env::current_exe() else { return };
     let mut cmd = Command::new(me);
     cmd.arg("--background")
-        .arg(&profile)
+        .arg(profile)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

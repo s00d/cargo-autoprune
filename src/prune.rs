@@ -91,11 +91,13 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     let now = SystemTime::now();
     let deleted_before = read_deleted(&state.join("deleted"), now);
     let mut pinned = read_pins(&state.join("pinned"), now);
+    let mut suspects = read_pins(&state.join("suspects"), now);
     let locals = local_packages(profile);
     let (units, incremental) = scan(profile, locals.is_some());
 
     let mut report = Report::default();
-    // A previously deleted unit is back: its group holds two live variants.
+    // A deleted unit was rebuilt. Once is a revert; a second comeback in the same group means two
+    // live variants alternate (`-p x` vs `--workspace` feature unification): pin the group.
     for (h, u) in &units {
         let local = locals
             .as_ref()
@@ -105,8 +107,12 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
             && deleted_before.contains_key(h.as_str())
             && !pinned.contains_key(&u.group())
         {
-            pinned.insert(u.group(), now);
-            report.pinned_now.push(u.group());
+            if suspects.remove(&u.group()).is_some() {
+                pinned.insert(u.group(), now);
+                report.pinned_now.push(u.group());
+            } else {
+                suspects.insert(u.group(), now);
+            }
         }
     }
     let (doomed, kept) = plan(units, incremental, &pinned, locals.as_ref(), cfg);
@@ -145,6 +151,7 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
         write_deleted(&state.join("deleted"), &deleted)?;
         clean_tags(&state.join(TAGS_DIR), profile);
         write_pins(&state.join("pinned"), &pinned)?;
+        write_pins(&state.join("suspects"), &suspects)?;
         log(&state.join("log"), &report);
     }
     Ok(Outcome::Done(report))
@@ -204,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn revert_after_window_is_not_pinned() {
+    fn single_comeback_is_a_revert_not_pinned() {
         let fx = Fx::new("revert");
         fx.lib("tokio", A, 10, false); // rebuilt after a revert
         fx.lib("tokio", B, 7200, false);
@@ -332,10 +339,15 @@ mod tests {
         fx.lib("tokio", A, 7200, false);
         fx.lib("tokio", B, 3600, false);
         assert_eq!(fx.run(&cfg()).removed_units, 1);
-        fx.lib("tokio", A, 10, false); // rebuilt: it was a live variant
+        fx.lib("tokio", A, 100, false); // rebuilt once: could be a revert, B goes
+        let r = fx.run(&cfg());
+        assert!(r.pinned_now.is_empty());
+        assert_eq!(r.removed_units, 1);
+        fx.lib("tokio", B, 10, false); // rebuilt again: two live variants alternate
         let r = fx.run(&cfg());
         assert_eq!(r.removed_units, 0);
         assert_eq!(r.pinned_now.len(), 1);
+        assert!(fx.exists(&format!("deps/libtokio-{A}.rlib")));
         assert!(fx.exists(&format!("deps/libtokio-{B}.rlib")));
         assert_eq!(fx.run(&cfg()).removed_units, 0); // pin persists
     }

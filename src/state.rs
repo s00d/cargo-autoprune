@@ -10,8 +10,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PIN_TTL: Duration = Duration::from_secs(24 * 3600);
-/// A deleted unit rebuilt within this window was a live variant, not a revert done later.
-const PIN_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// How long a deletion is remembered to notice the unit being rebuilt ("comeback").
+const PIN_WINDOW: Duration = Duration::from_secs(24 * 3600);
 const MAX_LOG_BYTES: u64 = 256 * 1024;
 
 /// `id\tunix_ts` of recent deletions; entries older than PIN_WINDOW are dropped.

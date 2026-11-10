@@ -138,7 +138,8 @@ A *unit* is everything with one metadata hash `H`: `.fingerprint/<pkg>-H/`, `bui
 | `incremental/<crate>-<id>/` | Follows its unit. The session's work products are hard links to the unit's `.rmeta` / `.rcgu.o` in `deps/`, so the inode identifies the owner. Without a shared inode (Linux deletes a binary's objects), units and dirs of the crate are paired one-to-one, closest mtime first. Dirs left without a unit are deleted |
 | Over `CARGO_AUTOPRUNE_MAX_SIZE` | The oldest remaining units go first |
 
-What it never touches: anything outside `target/<profile>/{deps,examples,.fingerprint,build,incremental}`,
+What it never touches: anything outside `target/<profile>/{deps,examples,.fingerprint,build,incremental}`
+(or `build-dir`),
 uplifted outputs in the profile root (`target/debug/app`), `target/doc`, `target/package` and `target/tmp`.
 It refuses to work on a dir without Cargo's `CACHEDIR.TAG`. A wrong guess costs one rebuild of that unit,
 never a broken build.
@@ -150,16 +151,19 @@ never a broken build.
 - `cargo build -p x` vs `cargo build --workspace` resolve features differently, so a crate is built
   against different dependencies: same config, different deps. A dependency bump looks the same.
 
-For the second case only timing helps. The pruner remembers deletions for 24 hours. A deleted unit
-that gets rebuilt is a *comeback*:
+For the second case the pruner remembers deletions for 24 hours, together with a hash of the
+workspace `Cargo.lock`. A deleted unit that gets rebuilt is a *comeback*:
 
-- The first comeback in a group is treated as a revert (you tried a dependency and went back), so
-  the group stays deduplicated.
-- A second comeback in the same group within 24 hours means two variants alternate. The group is
-  pinned and not deduplicated for 24 hours.
+- If `Cargo.lock` changed since the deletion, it is a dependency revert or toggle. It never counts,
+  however often you switch versions back and forth.
+- Under the same `Cargo.lock`, the first comeback in a group is noted and the second pins the group
+  for 24 hours. That costs alternating variants one extra rebuild.
 
-Alternating variants therefore cost one extra rebuild before the pin. Toggling a dependency back and
-forth twice looks the same as alternation and also pins.
+**Both build-dir layouts.** Cargo up to 1.99 uses flat `deps/` and `.fingerprint/` dirs. Cargo
+1.100's layout uses `build/<pkg>/<hash>/{fingerprint,out,run}`, one dir per unit, so a unit is
+deleted with a single rename. After an upgrade, legacy units are dropped once nothing has written
+them for a day longer than the new layout. A toolchain still in use keeps writing them, so they
+stay.
 
 State lives in `<profile>/.autoprune/`: `stamp`, `log`, `deleted`, `suspects`, `pinned`, `tags/`,
 `units`, `notice`. Each prune appends one line to `log`, with counts per reason.
@@ -180,20 +184,41 @@ until the size cap evicts them.
 
 ## Comparison
 
+**Head to head on a real workspace.** The test project is vld: 695 crates, a 5 GB target.
+Scenario: bump `itoa` in `Cargo.lock`, build, prune, then compare with a target built from scratch
+and rebuild.
+
+| | cargo-autoprune | cargo-sweep 0.8 (`--stamp` / `--file`) |
+|---|---|---|
+| freed | 3.0 GiB | 2.85 GiB |
+| garbage left (vs from-scratch target) | **0** | 196 files |
+| live files deleted | **0** | **2,799 files** |
+| next build | **0 crates** | **694 of 695 crates (full rebuild)** |
+| scan (dry run, warm) | 0.18–0.21 s | 0.47–0.74 s |
+| safe with a running cargo | yes (cargo's locks, 1 s batches) | no lock |
+
+cargo-sweep's stamp mode trusts access times. On macOS (and on Linux with `noatime`) cargo doesn't
+update them for files it only checks, so live artifacts look unused.
+
+All tools:
+
 | Tool | How it runs | What it deletes | How it chooses | Notes |
 |---|---|---|---|---|
-| **cargo-autoprune** | rustc-wrapper: automatic, in the background after builds | Superseded units, unreachable registry units, orphans, stale incremental dirs, old toolchains, optional size cap | Cargo's fingerprint graph, unit groups, mtime; waits for Cargo's locks | One config line, no daemon, zero dependencies |
-| [cargo-reclaim](https://github.com/ml-rust/cargo-reclaim) | Manual CLI (`scan`/`plan`/`apply`), or a scheduler service (launchd/systemd/Task Scheduler) on an interval or when free disk space is low | Incremental, fingerprints, dep-info, older hashed `deps` variants. Policies go up to the whole target and home caches | Filesystem scan. Keeps the newest of each hashed family and skips targets with a live cargo or recent writes | The closest analog. Large policy surface. No build hook, and doesn't understand the dependency graph |
-| [cargo-sweep](https://github.com/holmgr/cargo-sweep) | Manual CLI / GitHub Action | Files in target | `--time N` days, `--stamp`/`--file`, `--installed` toolchains, `--maxsize` | Simple. Age-based, so a day of churn survives `--time` entirely. The README says unmaintained |
+| **cargo-autoprune** | rustc-wrapper: automatic, in the background after builds; CLI; CI action; `-r` for servers | Superseded units, unreachable registry units, orphans, units of removed targets, stale incremental dirs, dead variants, old toolchains and layouts, optional size cap, idle whole targets | Cargo's fingerprint dependency graph, unit groups, comebacks under an unchanged `Cargo.lock`, hard-link inodes; takes Cargo's locks | One config line, no daemon, zero dependencies. Both build-dir layouts (cargo ≤ 1.99 and 1.100+) |
+| [cargo-reclaim](https://github.com/ml-rust/cargo-reclaim) | Manual CLI (`scan`/`plan`/`apply`), or a scheduler service (launchd/systemd/Task Scheduler) on an interval or when free disk space is low | Incremental, fingerprints, dep-info, older hashed `deps` variants. Policies go up to the whole target and home caches | Filesystem scan. Keeps the newest of each hashed family and skips targets with a live cargo or recent writes | Closest analog. No build hook and no dependency graph. Its docs warn that a "superseded" hash can be a live variant |
+| [cargo-sweep](https://github.com/holmgr/cargo-sweep) | Manual CLI / GitHub Action | Files in target | `--time N` days, `--stamp`/`--file` (atime), `--installed` toolchains, `--maxsize` | See the head to head above. README says unmaintained |
+| [Swatinem/rust-cache](https://github.com/Swatinem/rust-cache) | CI post-step | Everything in a profile except `build`, `.fingerprint`, `deps` (so `incremental/` and binaries go). Then workspace crates by name, or entries older than 7 days | Name matching against `cargo metadata`, mtime | Caches dependencies only, never workspace crates. Name-based, so superseded dependency versions stay up to 7 days |
+| [Leafwing cargo-cache](https://github.com/Leafwing-Studios/cargo-cache) | CI action (`sweep-cache: true`) | Files not used during the job | cargo-sweep-style stamp | Off by default; same atime caveat |
 | [cargo-cache](https://github.com/matthiaskrgr/cargo-cache) | Manual CLI | `~/.cargo` registry/git only | By type | Never touches target. Stale (2022) |
-| [cargo-clean-all](https://github.com/dnlmlr/cargo-clean-all) | Manual CLI, interactive | Whole `target/` of projects under a dir | Project age or size | All or nothing per project |
-| [kondo](https://github.com/tbillington/kondo) | Manual CLI / GUI | Whole artifact dirs, many ecosystems | Project age | Not Rust-specific |
-| [cargo-trim](https://github.com/iamsauravsharma/cargo-trim) | Manual CLI | `~/.cargo` registry/git, old crate versions | Version, age, orphans | Mostly about caches |
-| cargo-prune | Manual CLI | `~/.cargo` registry cache | Old versions | Dead (2019) |
-| cargo-gc-target | Manual `cargo gc` | `deps`, `build`, `.fingerprint` | Traces what the current workspace needs | Dead (2021). Breaks shared targets |
-| Cargo `-Zgc` / `cargo clean gc` | Automatic about daily (registry cache), nightly CLI | `~/.cargo` registry/git only | Last-use database | Target GC not implemented yet ([cargo#13136](https://github.com/rust-lang/cargo/issues/13136)) |
+| [cargo-clean-all](https://github.com/dnlmlr/cargo-clean-all), [clean-dev-dirs](https://docs.rs/crate/clean-dev-dirs), [kondo](https://github.com/tbillington/kondo), cargo-wipe, cargo-clean-recursive | Manual CLI | Whole `target/` dirs | Project age, size, interactive | All or nothing per project; `--remove-idle` covers this |
+| [cargo-trim](https://github.com/iamsauravsharma/cargo-trim), cargo-prune | Manual CLI | `~/.cargo` registry/git, old crate versions | Version, age | Caches, not target |
+| cargo-gc-target, cargo-target-gc | Manual CLI | Target artifacts | Workspace trace / undocumented | Dead (2021) / new (2026) |
+| Cargo `cargo clean -p` / `--profile` | Manual | A package's units or a profile | Package spec | Takes the lock; rebuilds what it deletes |
+| Cargo auto-GC (`-Zgc`, stable for `~/.cargo` since 2025) | Automatic, about daily | `~/.cargo` registry/git only | Last-use SQLite database | Target-dir GC: tracking issue [cargo#13136](https://github.com/rust-lang/cargo/issues/13136), whole idle dirs only (PR #16929, unmerged) |
+| cargo-chef, sccache, rust-analyzer `cargo.targetDir` | Docker stage / compiler cache / IDE setting | Nothing in target | – | Avoid or split the problem, don't clean it |
 
-None of the others prunes per build through a wrapper or uses the fingerprint dependency graph.
+Nothing else uses Cargo's fingerprint dependency graph or runs automatically after every build.
+The closest to "after every build" is a CI post-step.
 
 **Why a rustc-wrapper.** Cargo has no post-build hook. The alternatives are worse:
 

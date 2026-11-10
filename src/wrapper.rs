@@ -73,14 +73,30 @@ fn out_dir(args: &[OsString]) -> Option<PathBuf> {
 /// The profile dir is the nearest ancestor of the out dir that holds a Cargo lock file
 /// (`debug/deps`, `debug/build/x-<hash>`, `debug/examples`).
 fn profile_of(out: &Path) -> Option<PathBuf> {
+    // legacy: debug/deps, debug/build/x-<hash>; new layout: debug/build/<pkg>/<hash>/out
     out.ancestors()
-        .take(3)
+        .take(5)
         .find(|a| has_cargo_lock(a))
         .map(Path::to_path_buf)
 }
 
-/// `-C extra-filename=-<hash>` → `<hash>`.
+/// `-C extra-filename=-<hash>` → `<hash>`; in the new build-dir layout (no extra-filename for
+/// binaries) the unit dir: `--out-dir .../build/<pkg>/<hash>/out`.
 fn unit_hash(args: &[OsString]) -> Option<String> {
+    extra_filename(args).or_else(|| {
+        let out = out_dir(args)?;
+        let h = out.parent()?.file_name()?.to_str()?;
+        (out.file_name()? == "out" && is_hash(h)).then(|| h.to_owned())
+    })
+}
+
+fn is_hash(s: &str) -> bool {
+    s.len() == 16
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn extra_filename(args: &[OsString]) -> Option<String> {
     let mut prev_c = false;
     for a in args.iter().filter_map(|a| a.to_str()) {
         let v = if prev_c {
@@ -259,6 +275,25 @@ mod tests {
         let b: Vec<OsString> = vec!["-Cextra-filename=-aa".into()];
         assert_eq!(unit_hash(&b).as_deref(), Some("aa"));
         assert_eq!(unit_hash(&["-C".into(), "opt-level=0".into()]), None);
+    }
+
+    #[test]
+    fn unit_hash_from_new_layout_out_dir() {
+        let a: Vec<OsString> = [
+            "--crate-name",
+            "probe",
+            "--out-dir",
+            "/t/debug/build/probe/860b9d940d21e6fc/out",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(unit_hash(&a).as_deref(), Some("860b9d940d21e6fc"));
+        let b: Vec<OsString> = ["--out-dir", "/t/debug/deps"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(unit_hash(&b), None);
     }
 
     #[test]

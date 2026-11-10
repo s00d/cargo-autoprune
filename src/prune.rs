@@ -1,8 +1,7 @@
 //! One prune pass over a profile dir: lock, scan, plan, delete, record.
 
 use crate::fingerprint::{recorded_units, sibling_dep_values, workspace};
-use crate::fsutil::{entries, mtime, par_map, size_of};
-use crate::layout::split_hash;
+use crate::fsutil::{mtime, par_map, size_of};
 use crate::layout::{is_profile_dir, STATE_DIR, TAGS_DIR, UNITS_FILE};
 use crate::lock::{acquire_cargo_locks, lock_file};
 use crate::plan::{apply_cap, plan};
@@ -238,13 +237,7 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
                 None => break, // the rest waits for the next prune
             }
             hold = Instant::now();
-            let names = entries(&profile.join(".fingerprint"));
-            fp_hashes = Some(
-                names
-                    .iter()
-                    .filter_map(|e| split_hash(&e.name).map(|(_, h, _)| h.to_owned()))
-                    .collect(),
-            );
+            fp_hashes = Some(crate::layout::fingerprinted_hashes(profile));
         }
         if let Some(fps) = &fp_hashes {
             let unchanged = match &c.guard {

@@ -1,9 +1,8 @@
 //! Persistent state in `<profile>/.autoprune/`: recent deletions, pins, tags, log.
 
-use crate::fsutil::{atomic_write, human, read_dir};
-use crate::layout::split_hash;
+use crate::fsutil::{atomic_write, human};
 use crate::prune::Report;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -50,13 +49,10 @@ pub(crate) fn write_deleted(p: &Path, d: &Deleted) -> io::Result<()> {
 
 /// Drop tag files of units that no longer exist.
 pub(crate) fn clean_tags(tags: &Path, profile: &Path) {
-    let live: HashSet<String> = read_dir(&profile.join(".fingerprint"))
-        .into_iter()
-        .filter_map(|(n, _)| split_hash(&n).map(|(_, h, _)| h.to_owned()))
-        .collect();
-    for (h, p) in read_dir(tags) {
-        if !live.contains(&h) {
-            let _ = fs::remove_file(p);
+    let live = crate::layout::fingerprinted_hashes(profile);
+    for e in crate::fsutil::entries(tags) {
+        if !live.contains(&e.name) {
+            let _ = fs::remove_file(e.path);
         }
     }
 }

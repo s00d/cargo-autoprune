@@ -654,6 +654,82 @@ fn oracle_rebuild(ws: &Ws, cmds: &[&str], env: &[(&str, &str)]) -> std::path::Pa
     oracle
 }
 
+fn nightly_new_layout() -> Option<[(&'static str, &'static str); 2]> {
+    let ok = Command::new("rustup")
+        .args(["run", "nightly", "cargo", "-V"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    ok.then_some([
+        ("RUSTUP_TOOLCHAIN", "nightly"),
+        ("CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT", "true"),
+    ])
+}
+
+#[test]
+fn new_build_dir_layout() {
+    // cargo 1.100's layout: build/<pkg>/<hash>/{fingerprint,out,run}
+    let Some(env) = nightly_new_layout() else {
+        eprintln!("no nightly toolchain, skipped");
+        return;
+    };
+    let ws = Ws::new("newlayout");
+    let cmds = &CMDS[..3];
+    let run = |deps: &str| {
+        ws.deps(deps);
+        for c in cmds {
+            ws.cargo_in(c, &ws.target.clone(), true, &env);
+        }
+    };
+    run(&format!("{A10}\ndep_b = \"1\""));
+    assert!(
+        ws.target.join("debug/build/dep_a").is_dir(),
+        "not the new layout"
+    );
+    run(&format!("{A11}\ndep_b = \"1\""));
+    let reports = ws.prune();
+    assert!(reports.iter().map(|r| r.removed_units).sum::<usize>() > 0);
+    let oracle = ws.root.join("oracle-new");
+    for c in cmds {
+        ws.cargo_in(c, &oracle, false, &env);
+    }
+    let (a, b) = (inventory(&ws.target), inventory(&oracle));
+    let left: Vec<_> = a.difference(&b).collect();
+    let lost: Vec<_> = b.difference(&a).collect();
+    assert!(lost.is_empty(), "{lost:#?}");
+    assert!(left.is_empty(), "{left:#?}");
+    for c in cmds {
+        assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &env), 0);
+    }
+}
+
+#[test]
+fn upgrade_from_the_legacy_layout() {
+    // a target built by an older cargo, then by one with the new layout: the old units are dead
+    let Some(env) = nightly_new_layout() else {
+        eprintln!("no nightly toolchain, skipped");
+        return;
+    };
+    let ws = Ws::new("upgrade");
+    ws.deps(A10);
+    ws.cargo(CMDS[0]); // the current cargo: legacy layout
+    let legacy = ws.deps_files("debug", "libdep_a-").len();
+    assert!(legacy > 0);
+    age_tree(&ws.target, 2 * 24 * 3600); // two days later the toolchain is upgraded
+    ws.cargo_in(CMDS[0], &ws.target.clone(), true, &env);
+    ws.prune();
+    assert!(
+        ws.deps_files("debug", "libdep_a-").is_empty(),
+        "legacy dep_a copies left"
+    );
+    assert!(
+        !fs::read_dir(ws.target.join("debug/.fingerprint"))
+            .map(|d| d.count() > 0)
+            .unwrap_or(false),
+        "legacy fingerprints left"
+    );
+    assert_eq!(ws.cargo_in(CMDS[0], &ws.target.clone(), true, &env), 0);
+}
+
 fn host_triple() -> String {
     let out = Command::new("rustc").arg("-vV").output().unwrap();
     String::from_utf8_lossy(&out.stdout)

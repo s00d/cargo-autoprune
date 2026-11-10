@@ -26,6 +26,8 @@ use std::time::{Duration, SystemTime};
 
 /// A rustc hash not used for this long (relative to the newest unit) is an old toolchain.
 const RUSTC_RETIRE: Duration = Duration::from_secs(14 * 24 * 3600);
+/// Legacy-layout units not written for this long beyond the newest new-layout unit are dead.
+const LAYOUT_RETIRE: Duration = Duration::from_secs(24 * 3600);
 /// A profile/host variant of a package not rebuilt for this long while the package was.
 const VARIANT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -72,6 +74,17 @@ pub(crate) fn plan(
         (Some(n), Some(&r)) => r + RUSTC_RETIRE < n,
         _ => false,
     };
+    // After a cargo upgrade to the new build-dir layout the legacy units are dead once nothing
+    // wrote them for LAYOUT_RETIRE longer than the new ones (an old cargo still in use writes them).
+    let newest_of = |new: bool| {
+        units
+            .values()
+            .filter(|u| u.has_fingerprint && u.new_layout == new)
+            .filter_map(|u| u.mtime)
+            .max()
+    };
+    let legacy_dead =
+        matches!((newest_of(false), newest_of(true)), (Some(l), Some(n)) if l + LAYOUT_RETIRE < n);
 
     // Build-script *run* units never reach rustc, so they inherit the clippy tag of the compiled
     // build script they depend on.
@@ -109,6 +122,11 @@ pub(crate) fn plan(
                 reason: "orphan",
                 ..c
             }); // cargo rebuilds it anyway
+        } else if legacy_dead && !u.new_layout {
+            doomed.push(Candidate {
+                reason: "old layout",
+                ..c
+            });
         } else if retired(&u) {
             doomed.push(Candidate {
                 reason: "old toolchain",

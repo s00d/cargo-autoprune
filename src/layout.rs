@@ -59,6 +59,45 @@ pub fn is_profile_dir(p: &Path) -> bool {
             .any(|a| a.join("CACHEDIR.TAG").is_file())
 }
 
+/// Hashes of all units that have a fingerprint, in both layouts: `.fingerprint/<pkg>-<hash>` and
+/// `build/<pkg>/<hash>/fingerprint` (cargo 1.100+).
+pub(crate) fn fingerprinted_hashes(profile: &Path) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> =
+        crate::fsutil::entries(&profile.join(".fingerprint"))
+            .iter()
+            .filter_map(|e| split_hash(&e.name).map(|(_, h, _)| h.to_owned()))
+            .collect();
+    for pkg in crate::fsutil::entries(&profile.join("build")) {
+        if pkg.is_dir && split_hash(&pkg.name).is_none() {
+            for u in crate::fsutil::entries(&pkg.path) {
+                if u.is_dir && u.path.join("fingerprint").is_dir() {
+                    out.insert(u.name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fingerprint dirs of all units, in both layouts.
+pub(crate) fn fingerprint_dirs(profile: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = crate::fsutil::entries(&profile.join(".fingerprint"))
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    for pkg in crate::fsutil::entries(&profile.join("build")) {
+        if pkg.is_dir && split_hash(&pkg.name).is_none() {
+            out.extend(
+                crate::fsutil::entries(&pkg.path)
+                    .into_iter()
+                    .map(|u| u.path.join("fingerprint"))
+                    .filter(|f| f.is_dir()),
+            );
+        }
+    }
+    out
+}
+
 /// Cargo target dirs under `root` (dirs with `CACHEDIR.TAG` that hold profile dirs). Does not
 /// descend into a found target dir, hidden dirs or `node_modules`, and never follows symlinks.
 pub fn find_target_dirs(root: &Path) -> Vec<PathBuf> {

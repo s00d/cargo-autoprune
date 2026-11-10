@@ -77,12 +77,21 @@ impl Drop for Fx {
 
 pub(crate) fn set_age(p: &Path, secs: u64) {
     let t = SystemTime::now() - Duration::from_secs(secs);
+    open_for_times(p).unwrap().set_modified(t).unwrap();
+}
+
+#[cfg(windows)]
+fn open_for_times(p: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_WRITE_ATTRIBUTES, and FILE_FLAG_BACKUP_SEMANTICS so a directory can be opened
     File::options()
-        .read(true)
+        .access_mode(0x100)
+        .custom_flags(0x0200_0000)
         .open(p)
-        .unwrap()
-        .set_modified(t)
-        .unwrap();
+}
+#[cfg(not(windows))]
+fn open_for_times(p: &Path) -> std::io::Result<File> {
+    File::options().read(true).open(p)
 }
 
 pub(crate) fn cfg() -> Config {

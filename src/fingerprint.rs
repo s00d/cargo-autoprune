@@ -64,7 +64,7 @@ pub(crate) fn sibling_dep_values(profile: &Path) -> Vec<u64> {
     };
     let mut out = Vec::new();
     for p in profile_dirs(target).into_iter().filter(|p| p != profile) {
-        for (_, unit) in read_dir(&p.join(".fingerprint")) {
+        for unit in crate::layout::fingerprint_dirs(&p) {
             for (name, f) in read_dir(&unit) {
                 if name.ends_with(".json") {
                     out.extend(
@@ -200,6 +200,7 @@ mod tests {
                 .as_deref(),
             Some("app/src/main.rs")
         );
+        #[cfg(not(windows))] // a backslash is a path separator there, not an escape
         assert_eq!(
             first_dependency("/t/x: /a\\ b/lib.rs /c.rs").as_deref(),
             Some("/a b/lib.rs")

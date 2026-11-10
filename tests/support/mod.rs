@@ -122,7 +122,24 @@ impl Ws {
     }
 
     fn command(&self, args: &str, target: &Path, wrapper: bool) -> Command {
-        let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        self.command_with(args, target, wrapper, &[])
+    }
+
+    fn command_with(
+        &self,
+        args: &str,
+        target: &Path,
+        wrapper: bool,
+        envs: &[(&str, &str)],
+    ) -> Command {
+        // RUSTUP_TOOLCHAIN only works through the rustup proxy, not the cargo binary of this build
+        let proxy = envs.iter().any(|(k, _)| *k == "RUSTUP_TOOLCHAIN");
+        let program = if proxy {
+            "cargo".to_owned()
+        } else {
+            std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())
+        };
+        let mut c = Command::new(program);
         c.current_dir(&self.dir)
             .args(args.split_whitespace())
             .args(["--offline", "--color", "never"])
@@ -145,7 +162,7 @@ impl Ws {
         wrapper: bool,
         envs: &[(&str, &str)],
     ) -> usize {
-        let mut c = self.command(args, target, wrapper);
+        let mut c = self.command_with(args, target, wrapper, envs);
         c.envs(envs.iter().copied());
         let out = c.output().expect("run cargo");
         let n = self.n.fetch_add(1, Ordering::SeqCst);
@@ -322,6 +339,20 @@ pub fn inventory(target: &Path) -> BTreeSet<String> {
                     _ => n,
                 };
                 out.insert(format!("{rel}/{area}/{n}"));
+            }
+        }
+        // new build-dir layout: build/<pkg>/<hash>
+        for pkg in ls(&prof.join("build")) {
+            if prof.join("build").join(&pkg).join(".").is_dir() && !pkg.contains('-')
+                || fs::read_dir(prof.join("build").join(&pkg))
+                    .map(|mut d| d.any(|e| e.is_ok_and(|e| e.file_name().len() == 16)))
+                    .unwrap_or(false)
+            {
+                for u in ls(&prof.join("build").join(&pkg)) {
+                    if u.len() == 16 {
+                        out.insert(format!("{rel}/build/{pkg}/{u}"));
+                    }
+                }
             }
         }
         for n in ls(&prof) {

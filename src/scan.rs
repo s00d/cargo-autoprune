@@ -28,6 +28,7 @@ pub(crate) struct Unit {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) mtime: Option<SystemTime>,
     pub(crate) guard: Option<PathBuf>, // the file `mtime` was read from (fingerprinted units)
+    pub(crate) new_layout: bool,       // build/<pkg>/<hash>/ (cargo 1.100+)
 }
 
 impl Unit {
@@ -50,6 +51,57 @@ impl Unit {
             self.sig
         )
     }
+}
+
+/// Fill a unit from its fingerprint dir (`.fingerprint/<pkg>-<hash>` or `build/<pkg>/<hash>/fingerprint`).
+fn read_fingerprint(
+    u: &mut Unit,
+    pkg: &str,
+    dir: &Path,
+    with_sig: bool,
+    tags: &HashMap<String, String>,
+    h: &str,
+) {
+    let files = entries(dir);
+    if files.is_empty() {
+        return;
+    }
+    u.name = Some(pkg.to_owned());
+    u.has_fingerprint = true;
+    // file names encode the target kind: lib-x, test-lib-x, bin-x, build-script-..., run-build-script-...
+    u.fp_kind = files
+        .iter()
+        .map(|f| f.name.clone())
+        .filter(|n| n != "invoked.timestamp" && !n.starts_with("output-"))
+        .collect();
+    if let Some(json) = u.fp_kind.iter().find(|n| n.ends_with(".json")).cloned() {
+        let text = fs::read_to_string(dir.join(&json)).unwrap_or_default();
+        (u.rustc, u.dep_values) = parse_fingerprint_json(&text);
+        if with_sig {
+            u.sig = json_signature(&text);
+        }
+        u.fp_value = fs::read_to_string(dir.join(json.trim_end_matches(".json")))
+            .ok()
+            .and_then(|h| parse_le_hex(h.trim()));
+    }
+    u.tag = tags.get(h).cloned().unwrap_or_default();
+    // cargo writes invoked.timestamp every time it builds the unit
+    let stamp = files.iter().find(|f| f.name == "invoked.timestamp");
+    let guard = stamp.map_or(dir, |f| &f.path).to_path_buf();
+    u.mtime = mtime(&guard);
+    u.guard = Some(guard);
+}
+
+fn has_files(dir: &Path) -> bool {
+    entries(dir)
+        .into_iter()
+        .any(|e| !e.is_dir || has_files(&e.path))
+}
+
+fn is_hash(s: &str) -> bool {
+    s.len() == 16
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 /// Start time encoded in an incremental session dir name: `s-<micros, base 36>-<random>[-<svh>]`.
@@ -79,34 +131,8 @@ pub(crate) fn scan(
         let (pkg, h, "") = split_hash(&e.name)? else {
             return None;
         };
-        let mut u = Unit {
-            name: Some(pkg.to_owned()),
-            has_fingerprint: true,
-            ..Unit::default()
-        };
-        // file names encode the target kind: lib-x, test-lib-x, bin-x, build-script-..., run-build-script-...
-        let files = entries(&e.path);
-        u.fp_kind = files
-            .iter()
-            .map(|f| f.name.clone())
-            .filter(|n| n != "invoked.timestamp" && !n.starts_with("output-"))
-            .collect();
-        if let Some(json) = u.fp_kind.iter().find(|n| n.ends_with(".json")).cloned() {
-            let text = fs::read_to_string(e.path.join(&json)).unwrap_or_default();
-            (u.rustc, u.dep_values) = parse_fingerprint_json(&text);
-            if with_sig {
-                u.sig = json_signature(&text);
-            }
-            u.fp_value = fs::read_to_string(e.path.join(json.trim_end_matches(".json")))
-                .ok()
-                .and_then(|h| parse_le_hex(h.trim()));
-        }
-        u.tag = tags.get(h).cloned().unwrap_or_default();
-        // cargo writes invoked.timestamp every time it builds the unit
-        let stamp = files.iter().find(|f| f.name == "invoked.timestamp");
-        let guard = stamp.map_or(&e.path, |f| &f.path).clone();
-        u.mtime = mtime(&guard);
-        u.guard = Some(guard);
+        let mut u = Unit::default();
+        read_fingerprint(&mut u, pkg, &e.path, with_sig, &tags, h);
         let h = h.to_owned();
         u.paths.push(e.path);
         Some((h, u))
@@ -153,6 +179,64 @@ pub(crate) fn scan(
                 u.dep_info = Some(e.path.clone());
             }
             u.paths.push(e.path);
+        }
+    }
+    // new build-dir layout (cargo 1.100+): build/<pkg>/<hash>/{fingerprint,out,run}, one dir per
+    // unit. A hash also present in the legacy layout above is then a dead copy of the old layout.
+    for pkg in entries(&profile.join("build")) {
+        if !pkg.is_dir || split_hash(&pkg.name).is_some() {
+            continue;
+        }
+        for e in entries(&pkg.path)
+            .into_iter()
+            .filter(|e| e.is_dir && is_hash(&e.name))
+        {
+            if !e.path.join("fingerprint").is_dir() && !has_files(&e.path) {
+                continue; // an empty out/ cargo prepared: costs nothing, may be needed
+            }
+            let legacy = units.remove(&e.name);
+            let u = units.entry(e.name.clone()).or_default();
+            read_fingerprint(
+                u,
+                &pkg.name,
+                &e.path.join("fingerprint"),
+                with_sig,
+                &tags,
+                &e.name,
+            );
+            u.stem = pkg.name.clone();
+            for f in entries(&e.path.join("out")) {
+                let rest = f.name.split_once('.').map_or("", |(_, r)| r);
+                let kind = match rest {
+                    "" if !f.is_dir => Some("bin"),
+                    "rlib" | "rmeta" | "dylib" | "so" | "dll" | "a" | "lib" | "exe" | "wasm" => {
+                        out_kind(&format!(".{rest}"), f.is_dir)
+                    }
+                    _ => None,
+                };
+                u.out_kind.extend(kind);
+                if rest == "rmeta" || f.name.ends_with(".rcgu.o") {
+                    u.inodes.extend(f.ino);
+                }
+                if rest == "d" {
+                    let stem = f.name.trim_end_matches(".d");
+                    let krate = split_hash(stem).map_or(stem, |(s, _, _)| s);
+                    u.krate = Some(krate.to_owned());
+                    u.dep_info = Some(f.path.clone());
+                }
+            }
+            u.paths = vec![e.path];
+            u.new_layout = true;
+            if let Some(old) = legacy {
+                // same hash in the old layout: cargo uses only the new dir now
+                units.insert(
+                    format!("{}~legacy", e.name),
+                    Unit {
+                        has_fingerprint: false,
+                        ..old
+                    },
+                );
+            }
         }
     }
     ph.mark("scan deps");

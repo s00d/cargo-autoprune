@@ -220,8 +220,9 @@ fn size_cap_evicts_oldest_but_builds_still_work() {
         lock_wait: Duration::from_secs(60),
         ..Config::default()
     });
+    // the cap counts unit files; a few profile files belong to no unit (Linux: ~6%)
     assert!(
-        dir_size(&debug) <= cap + 64 * 1024,
+        dir_size(&debug) <= cap + cap / 10,
         "{} > {cap}",
         dir_size(&debug)
     );
@@ -706,12 +707,12 @@ fn background_failure_leaves_a_notice() {
     );
     // nothing to report there (no state dir can be trusted), but a real profile reports errors:
     let debug = ws.target.join("debug");
-    let deps = debug.join("deps");
     ws.deps(A11);
     ws.run_all(&CMDS[..1]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let deps = debug.join("deps");
         fs::set_permissions(&deps, fs::Permissions::from_mode(0o555)).unwrap(); // unlink fails
         let out = Command::new(BIN)
             .arg("--background")

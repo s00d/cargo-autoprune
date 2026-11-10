@@ -471,6 +471,7 @@ mod tests {
             );
             set_age(&fx.prof.join(format!(".fingerprint/gs-at-{h}")), age);
             let exe = fx.file(&format!("deps/urc-{h}"), age);
+            let _ = &exe; // used by the unix-only permission bit below
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

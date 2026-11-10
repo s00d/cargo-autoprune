@@ -10,7 +10,7 @@ background, and keeps everything the current build needs.
 ## Install (one line of config)
 
 ```bash
-cargo install --path .        # not on crates.io
+cargo install cargo-autoprune
 ```
 
 `~/.cargo/config.toml`:
@@ -76,7 +76,7 @@ after your steps):
     key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
     restore-keys: cargo-${{ runner.os }}-
 - run: cargo test
-- uses: s00d/cargo-autoprune@main   # = cargo autoprune --ci .
+- uses: s00d/cargo-autoprune@0.1.0  # = cargo autoprune --ci .
   with:
     max-size: 4G                    # optional
 ```
@@ -254,15 +254,16 @@ is one extra `exec` per compiled crate.
 
 ## Measurements (macOS, Apple Silicon, cargo 1.99)
 
-**Self-test** (`scripts/self-test.sh`): this crate's own `cargo test` (three test executables) is run
-four times with a version bump each time, which rehashes every unit.
+**Self-test** (`scripts/self-test.sh`): this crate's own `cargo test` (three test executables) runs four
+times on a throwaway copy, with a different package version in the copy each time. That rehashes
+every unit, the way a dependency change does.
 
 | Run | No wrapper | With cargo-autoprune |
 |---|---|---|
-| v0.1.1 | 64.6 MiB, 3 test exes | 64.6 MiB, 3 |
-| v0.1.2 | 126.8 MiB, 6 | 64.6 MiB, 3 (pruned 80.6 MiB in 170 ms) |
-| v0.1.3 | 189.1 MiB, 9 | 64.6 MiB, 3 |
-| v0.1.4 | 251.4 MiB, 12 | 64.6 MiB, 3 |
+| run 1 | 64.6 MiB, 3 test exes | 64.6 MiB, 3 |
+| run 2 | 126.8 MiB, 6 | 64.6 MiB, 3 (pruned 80.6 MiB in 170 ms) |
+| run 3 | 189.1 MiB, 9 | 64.6 MiB, 3 |
+| run 4 | 251.4 MiB, 12 | 64.6 MiB, 3 |
 
 A rebuild right after the last run: `Finished ... in 0.00s`. Nothing is recompiled, so the cache survives.
 

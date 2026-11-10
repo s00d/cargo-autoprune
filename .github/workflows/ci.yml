@@ -45,14 +45,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --all-targets
-      - run: sed -i 's/^version = "0.1.0"/version = "0.1.1"/' Cargo.toml && cargo build --all-targets
-      - run: du -sh target
+      # a throwaway copy, so the repository's own Cargo.toml is never touched: a different package
+      # version there rehashes every unit, the way a dependency change does
+      - run: cp -r . "$RUNNER_TEMP/copy" && cd "$RUNNER_TEMP/copy" && cargo build --all-targets
+      - run: cd "$RUNNER_TEMP/copy" && sed -i 's/^version = ".*"/version = "9.9.9"/' Cargo.toml && cargo build --all-targets && du -sh target
       - uses: ./
         with:
+          path: ${{ runner.temp }}/copy
           args: --verbose
-      - run: du -sh target
       - name: nothing rebuilds after the prune
         run: |
+          cd "$RUNNER_TEMP/copy" && du -sh target
           cargo build --all-targets 2>&1 | tee build.log
           ! grep -q Compiling build.log

@@ -14,14 +14,13 @@ const STAMP: &str = ".autoprune/stamp";
 const DEFAULT_INTERVAL: u64 = 300;
 
 pub fn run_wrapper(args: Vec<OsString>) -> ! {
-    if let Some(profile) = out_dir(&args).as_deref().and_then(profile_of) {
+    let profile = out_dir(&args).as_deref().and_then(profile_of);
+    if let Some(profile) = &profile {
         // both are needed even with the background prune off
-        tag_workspace_wrapper(&args, &profile);
-        record_unit(&args, &profile);
-        if env::var_os("CARGO_AUTOPRUNE").is_none_or(|v| v != "0") {
-            maybe_trigger(&profile);
-        }
+        tag_workspace_wrapper(&args, profile);
+        record_unit(&args, profile);
     }
+    let enabled = env::var_os("CARGO_AUTOPRUNE").is_none_or(|v| v != "0");
     let mut cmd = match env::var_os("CARGO_AUTOPRUNE_WRAPPER").filter(|w| !w.is_empty()) {
         Some(w) => {
             let mut c = Command::new(w);
@@ -34,27 +33,63 @@ pub fn run_wrapper(args: Vec<OsString>) -> ! {
             c
         }
     };
-    run(&mut cmd)
+    run(&mut cmd, profile.filter(|_| enabled))
 }
 
+/// Unix: spawn the pruner, then `exec` rustc (the pruner gets no cargo pipe: stdio is null and
+/// every other descriptor is close-on-exec).
 #[cfg(unix)]
-fn run(cmd: &mut Command) -> ! {
+fn run(cmd: &mut Command, prune: Option<PathBuf>) -> ! {
     use std::os::unix::process::CommandExt;
+    if let Some(p) = prune {
+        maybe_trigger(&p);
+    }
     let e = cmd.exec();
     eprintln!("cargo-autoprune: cannot exec {:?}: {e}", cmd.get_program());
     std::process::exit(127)
 }
 
+/// Windows: no exec. Run rustc first, then spawn the pruner with our std handles made
+/// non-inheritable: Windows hands every inheritable handle to a child, and a pruner holding
+/// cargo's output pipe would make cargo wait for it while it waits for cargo's lock.
 #[cfg(not(unix))]
-fn run(cmd: &mut Command) -> ! {
-    match cmd.status() {
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+fn run(cmd: &mut Command, prune: Option<PathBuf>) -> ! {
+    let code = match cmd.status() {
+        Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
             eprintln!("cargo-autoprune: cannot run {:?}: {e}", cmd.get_program());
-            std::process::exit(127)
+            127
+        }
+    };
+    if let Some(p) = prune {
+        no_inherit_std_handles();
+        maybe_trigger(&p);
+    }
+    std::process::exit(code)
+}
+
+#[cfg(windows)]
+fn no_inherit_std_handles() {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetHandleInformation(h: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for h in handles {
+        if !h.is_null() {
+            // SAFETY: a handle of this process; only its inherit flag changes
+            unsafe { SetHandleInformation(h.cast(), HANDLE_FLAG_INHERIT, 0) };
         }
     }
 }
+#[cfg(all(not(unix), not(windows)))]
+fn no_inherit_std_handles() {}
 
 /// `--out-dir X` / `--out-dir=X` from a rustc command line.
 fn out_dir(args: &[OsString]) -> Option<PathBuf> {

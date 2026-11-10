@@ -15,7 +15,11 @@ const PIN_WINDOW: Duration = Duration::from_secs(24 * 3600);
 const MAX_LOG_BYTES: u64 = 256 * 1024;
 
 /// `id\tunix_ts` of recent deletions; entries older than PIN_WINDOW are dropped.
-pub(crate) fn read_deleted(p: &Path, now: SystemTime) -> HashMap<String, u64> {
+/// A recent deletion: when, and the workspace `Cargo.lock` hash at that moment.
+pub(crate) type Deleted = HashMap<String, (u64, String)>;
+
+/// `id\tunix_ts\tlock_hash` of recent deletions; entries older than PIN_WINDOW are dropped.
+pub(crate) fn read_deleted(p: &Path, now: SystemTime) -> Deleted {
     let horizon = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -25,15 +29,22 @@ pub(crate) fn read_deleted(p: &Path, now: SystemTime) -> HashMap<String, u64> {
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
-            let (id, ts) = l.rsplit_once('\t')?;
-            let ts: u64 = ts.parse().ok()?;
-            (ts >= horizon).then(|| (id.to_owned(), ts))
+            let mut f = l.split('\t');
+            let (id, ts, lock) = (
+                f.next()?,
+                f.next()?.parse::<u64>().ok()?,
+                f.next().unwrap_or(""),
+            );
+            (ts >= horizon).then(|| (id.to_owned(), (ts, lock.to_owned())))
         })
         .collect()
 }
 
-pub(crate) fn write_deleted(p: &Path, d: &HashMap<String, u64>) -> io::Result<()> {
-    let s: String = d.iter().map(|(id, ts)| format!("{id}\t{ts}\n")).collect();
+pub(crate) fn write_deleted(p: &Path, d: &Deleted) -> io::Result<()> {
+    let s: String = d
+        .iter()
+        .map(|(id, (ts, lock))| format!("{id}\t{ts}\t{lock}\n"))
+        .collect();
     atomic_write(p, &s)
 }
 

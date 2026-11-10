@@ -32,7 +32,9 @@ fn dependency_version_bump() {
     let ws = Ws::new("bump");
     step(&ws, A10, CMDS);
     step(&ws, A11, CMDS);
-    step(&ws, A10, CMDS); // quick revert: one comeback is not a pin
+    step(&ws, A10, CMDS); // quick revert
+    step(&ws, A11, CMDS); // and back again: Cargo.lock changed each time, so no pin
+    step(&ws, A10, CMDS);
     assert_eq!(ws.pins(), 0);
 }
 
@@ -706,12 +708,12 @@ fn background_failure_leaves_a_notice() {
         "wrote state into a non-cargo dir"
     );
     // nothing to report there (no state dir can be trusted), but a real profile reports errors:
-    let debug = ws.target.join("debug");
     ws.deps(A11);
     ws.run_all(&CMDS[..1]);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let debug = ws.target.join("debug");
         let deps = debug.join("deps");
         fs::set_permissions(&deps, fs::Permissions::from_mode(0o555)).unwrap(); // unlink fails
         let out = Command::new(BIN)

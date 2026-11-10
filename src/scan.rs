@@ -52,6 +52,15 @@ impl Unit {
     }
 }
 
+/// Start time encoded in an incremental session dir name: `s-<micros, base 36>-<random>[-<svh>]`.
+pub(crate) fn session_start(name: &str) -> Option<SystemTime> {
+    let ts = name.strip_prefix("s-")?.split('-').next()?;
+    let micros = u64::from_str_radix(ts, 36)
+        .ok()
+        .filter(|&m| m >= 946_684_800_000_000)?; // >= 2000
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_micros(micros))
+}
+
 /// `incremental/<crate>-<id>` dirs: name, path, mtime, inodes of their session files.
 pub(crate) type Incremental = Vec<(String, PathBuf, Option<SystemTime>, Vec<u64>)>;
 
@@ -152,16 +161,37 @@ pub(crate) fn scan(
         .filter(|e| e.is_dir && e.name.contains('-'))
         .collect();
     let incremental = par_map(dirs, |e| {
-        let inodes = entries(&e.path)
+        let sessions: Vec<_> = entries(&e.path)
             .into_iter()
             .filter(|s| s.is_dir && s.name.starts_with("s-"))
+            .collect();
+        // when the newest session started: `s-<micros since epoch, base 36>-...`, the same moment
+        // cargo writes the unit's invoked.timestamp (closer than the dir's mtime, which is the end)
+        let started = sessions.iter().filter_map(|s| session_start(&s.name)).max();
+        let inodes = sessions
+            .iter()
             .flat_map(|s| entries(&s.path))
             .filter(|f| f.name.ends_with(".o") || f.name == "metadata.rmeta")
             .filter_map(|f| f.ino)
             .collect();
-        let t = mtime(&e.path);
+        let t = started.or_else(|| mtime(&e.path));
         (e.name, e.path, t, inodes)
     });
     ph.mark("scan incremental");
     (units, incremental)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_start_decodes_rustc_names() {
+        let t = session_start("s-ho1077drys-0o8e2xo-8bdb6vc1lqjdqqtb962q6qng5").unwrap();
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!((1_790_000_000..1_800_000_000).contains(&secs), "{secs}"); // November 2026
+        assert!(session_start("s-ho1077drys-0o8e2xo.lock").is_some());
+        assert_eq!(session_start("not-a-session"), None);
+        assert_eq!(session_start("s-x"), None);
+    }
 }

@@ -236,8 +236,15 @@ impl Ws {
             };
             let aged: String = s
                 .lines()
-                .filter_map(|l| l.rsplit_once('\t'))
-                .map(|(id, ts)| format!("{id}\t{}\n", ts.parse::<u64>().unwrap() - secs))
+                .filter_map(|l| {
+                    let mut f = l.splitn(3, '\t');
+                    Some((
+                        f.next()?,
+                        f.next()?.parse::<u64>().ok()?,
+                        f.next().unwrap_or(""),
+                    ))
+                })
+                .map(|(id, ts, lock)| format!("{id}\t{}\t{lock}\n", ts - secs))
                 .collect();
             fs::write(f, aged).unwrap();
         }

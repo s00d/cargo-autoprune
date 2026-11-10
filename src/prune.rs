@@ -63,6 +63,21 @@ impl Phases {
     }
 }
 
+/// Hash of the workspaces' `Cargo.lock` files: tells a dependency change from variants that
+/// alternate under the same lock file.
+fn lockfile_hash(ws: &crate::fingerprint::Workspace) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut roots = ws.roots.clone();
+    roots.sort();
+    for r in roots {
+        fs::read(r.join("Cargo.lock"))
+            .unwrap_or_default()
+            .hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
 fn remove_path(p: &Path) -> Option<String> {
     let r = match fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => fs::remove_dir_all(p),
@@ -162,15 +177,17 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     }
 
     let mut report = Report::default();
-    // A deleted unit was rebuilt. Once is a revert; a second comeback in the same group means two
-    // live variants alternate (`-p x` vs `--workspace` feature unification): pin the group.
+    // A deleted unit was rebuilt. If Cargo.lock changed since it was deleted, that is a dependency
+    // revert or toggle and does not count. Otherwise (same lock file: `-p x` vs `--workspace`
+    // feature unification) it counts; a second such comeback in a group pins it.
+    let lock_hash = ws.as_ref().map(lockfile_hash).unwrap_or_default();
     for (h, u) in &units {
         let local = ws
             .as_ref()
             .is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
         if u.has_fingerprint
             && local
-            && deleted_before.remove(h.as_str()).is_some() // a comeback counts once
+            && deleted_before.remove(h.as_str()).is_some_and(|(_, lock)| lock == lock_hash) // once
             && !pinned.contains_key(&u.group())
         {
             if suspects.remove(&u.group()).is_some() {
@@ -275,7 +292,11 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     if !cfg.dry_run {
         let mut deleted = deleted_before;
         let ts = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        deleted.extend(new_deleted.iter().map(|id| (id.clone(), ts)));
+        deleted.extend(
+            new_deleted
+                .iter()
+                .map(|id| (id.clone(), (ts, lock_hash.clone()))),
+        );
         write_deleted(&state.join("deleted"), &deleted)?;
         clean_tags(&state.join(TAGS_DIR), profile);
         write_pins(&state.join("pinned"), &pinned)?;
@@ -502,6 +523,24 @@ mod tests {
         assert!(fx.exists(&format!("deps/libtokio-{A}.rlib")));
         assert!(fx.exists(&format!("deps/libtokio-{B}.rlib")));
         assert_eq!(fx.run(&cfg()).removed_units, 0); // pin persists
+    }
+
+    #[test]
+    fn dependency_toggles_never_pin() {
+        // the same unit comes back twice, but Cargo.lock changed each time: reverts, not variants
+        let fx = Fx::new("toggle");
+        fx.lockfile(&["tokio"], &["a"]);
+        fx.lib("tokio", A, 7200, false);
+        fx.lib("tokio", B, 3600, false);
+        assert_eq!(fx.run(&cfg()).removed_units, 1); // A goes
+        fx.lockfile(&["tokio"], &["b"]);
+        fx.lib("tokio", A, 2000, false); // back after a lock change
+        assert!(fx.run(&cfg()).pinned_now.is_empty()); // B goes
+        fx.lockfile(&["tokio"], &["a"]);
+        fx.lib("tokio", B, 10, false); // and again
+        let r = fx.run(&cfg());
+        assert!(r.pinned_now.is_empty(), "{:?}", r.pinned_now);
+        assert_eq!(r.removed_units, 1);
     }
 
     #[test]

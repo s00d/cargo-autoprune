@@ -17,10 +17,12 @@
 //! The `rustc` hash in the json separates `clippy-driver` from `rustc` builds; a hash with no
 //! writes for `RUSTC_RETIRE` before the newest unit (old toolchain) is dropped entirely.
 
+use crate::fingerprint::Workspace;
 use crate::fsutil::size_of;
 use crate::prune::Config;
 use crate::scan::{Incremental, Unit};
 use std::collections::{BTreeMap, HashMap, HashSet};
+
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -29,7 +31,9 @@ const RUSTC_RETIRE: Duration = Duration::from_secs(14 * 24 * 3600);
 
 pub(crate) struct Candidate {
     pub(crate) krate: Option<String>,
+    pub(crate) value: Option<u64>,
     pub(crate) id: String, // what goes into the `deleted` log: hash or `inc:<dir>`
+    pub(crate) inodes: Vec<u64>,
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) mtime: Option<SystemTime>,
     pub(crate) incremental: bool,
@@ -39,7 +43,8 @@ pub(crate) fn plan(
     units: BTreeMap<String, Unit>,
     incremental: Incremental,
     pinned: &HashMap<String, SystemTime>,
-    locals: Option<&HashSet<String>>,
+    ws: Option<&Workspace>,
+    extra_roots: Vec<u64>,
     cfg: &Config,
 ) -> (Vec<Candidate>, Vec<Candidate>) {
     let mut doomed = Vec::new();
@@ -77,38 +82,62 @@ pub(crate) fn plan(
         }
     }
 
-    let mut groups: HashMap<String, Vec<(Candidate, Vec<u64>)>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<(Candidate, Vec<u64>, bool)>> = HashMap::new();
     let mut registry: Vec<(Candidate, Option<u64>, Vec<u64>)> = Vec::new();
     for (h, u) in units {
-        let local = locals.is_none_or(|l| l.contains(u.name.as_deref().unwrap_or("")));
+        let local = ws.is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
         let c = Candidate {
             krate: if local { u.krate.clone() } else { None }, // only workspace crates are incremental
+            value: u.fp_value,
             id: h,
+            inodes: u.inodes.clone(),
             paths: u.paths.clone(),
             mtime: u.mtime,
             incremental: false,
         };
-        if !u.has_fingerprint || retired(&u) {
+        let removed = || match (ws, &u.dep_info) {
+            (Some(w), Some(d)) if local => w.target_removed(d),
+            _ => false,
+        };
+        if !u.has_fingerprint || retired(&u) || removed() {
             doomed.push(c); // no fingerprint: cargo rebuilds it anyway
         } else if local {
-            groups.entry(u.group()).or_default().push((c, u.dep_values));
+            let is_run = u.fp_kind.iter().any(|k| k.starts_with("run-build-script"));
+            groups
+                .entry(u.group())
+                .or_default()
+                .push((c, u.dep_values, is_run));
         } else {
             registry.push((c, u.fp_value, u.dep_values));
         }
     }
 
     // Dedup workspace units (all units when locality is unknown).
-    let mut roots: Vec<u64> = Vec::new();
+    let mut roots: Vec<u64> = extra_roots;
+    let mut kept_local = Vec::new();
     for (key, members) in groups {
-        let newest = members.iter().filter_map(|(c, _)| c.mtime).max();
-        for (c, deps) in members {
+        let newest = members.iter().filter_map(|(c, _, _)| c.mtime).max();
+        for (c, deps, is_run) in members {
             let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n);
             if stale && !pinned.contains_key(&key) {
                 doomed.push(c);
             } else {
-                roots.extend(deps);
-                kept.push(c);
+                kept_local.push((c, deps, is_run));
             }
+        }
+    }
+    // A build-script run whose compiled build script is going away goes with it.
+    let doomed_vals: HashSet<u64> = doomed.iter().filter_map(|c| c.value).collect();
+    let kept_vals: HashSet<u64> = kept_local.iter().filter_map(|(c, _, _)| c.value).collect();
+    for (c, deps, is_run) in kept_local {
+        let orphan_run = is_run
+            && deps.iter().any(|v| doomed_vals.contains(v))
+            && !deps.iter().any(|v| kept_vals.contains(v));
+        if orphan_run {
+            doomed.push(c);
+        } else {
+            roots.extend(deps);
+            kept.push(c);
         }
     }
 
@@ -137,40 +166,81 @@ pub(crate) fn plan(
         }
     }
 
-    // `incremental/<crate>-<stable id>` cannot be mapped by hash. Its session is written when its
-    // unit is compiled, so it follows the unit of the same crate with the closest mtime.
-    let mut by_crate: HashMap<&str, Vec<(SystemTime, bool)>> = HashMap::new();
+    // `incremental/<crate>-<stable id>` cannot be mapped by hash. Its session files are hard links
+    // to the unit's `.rmeta` / `.rcgu.o` in `deps/`, which identifies the owner exactly. Without a
+    // shared inode (Linux drops a binary's objects) units and dirs of one crate are paired
+    // one-to-one, closest mtimes first. A dir left without a unit goes.
+    let mut owner: HashMap<u64, (&str, bool)> = HashMap::new();
     for (list, is_doomed) in [(&doomed, true), (&kept, false)] {
         for c in list.iter() {
+            for &i in &c.inodes {
+                owner.insert(i, (c.id.as_str(), is_doomed));
+            }
+        }
+    }
+    let mut keep_dir: Vec<Option<bool>> = vec![None; incremental.len()];
+    let mut claimed: HashSet<&str> = HashSet::new();
+    for (k, (_, _, _, inodes)) in incremental.iter().enumerate() {
+        if let Some(&(id, is_doomed)) = inodes.iter().find_map(|i| owner.get(i)) {
+            keep_dir[k] = Some(!is_doomed);
+            claimed.insert(id);
+        }
+    }
+    let mut by_crate: HashMap<&str, Vec<(SystemTime, bool)>> = HashMap::new();
+    for (list, is_doomed) in [(&doomed, true), (&kept, false)] {
+        for c in list.iter().filter(|c| !claimed.contains(c.id.as_str())) {
             if let (Some(k), Some(t)) = (c.krate.as_deref(), c.mtime) {
                 by_crate.entry(k).or_default().push((t, is_doomed));
             }
         }
     }
     let gap = |a: SystemTime, b: SystemTime| a.duration_since(b).unwrap_or_else(|e| e.duration());
+    let mut dirs_by_crate: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (dir, _, _, _)) in incremental.iter().enumerate() {
+        if keep_dir[i].is_none() {
+            let krate = dir.rsplit_once('-').map_or(dir.as_str(), |(c, _)| c);
+            dirs_by_crate.entry(krate.to_owned()).or_default().push(i);
+        }
+    }
+    for (krate, dirs) in &dirs_by_crate {
+        let Some(units) = by_crate.get(krate.as_str()) else {
+            continue;
+        };
+        let mut pairs = Vec::new();
+        for &d in dirs {
+            if let Some(t) = incremental[d].2 {
+                for (u, &(ut, _)) in units.iter().enumerate() {
+                    pairs.push((gap(ut, t), d, u));
+                }
+            }
+        }
+        pairs.sort();
+        let (mut dir_taken, mut unit_taken) = (HashSet::new(), HashSet::new());
+        for (_, d, u) in pairs {
+            if !dir_taken.contains(&d) && !unit_taken.contains(&u) {
+                dir_taken.insert(d);
+                unit_taken.insert(u);
+                keep_dir[d] = Some(!units[u].1);
+            }
+        }
+    }
+    let keep_dir: Vec<bool> = keep_dir.into_iter().map(|k| k.unwrap_or(false)).collect();
     let mut inc_doomed = Vec::new();
     let mut inc_kept = Vec::new();
-    for (dir, path, t) in incremental {
-        let krate = dir.rsplit_once('-').map_or(dir.as_str(), |(c, _)| c);
-        let nearest = match (by_crate.get(krate), t) {
-            (Some(units), Some(t)) => units
-                .iter()
-                .min_by_key(|(ut, _)| gap(*ut, t))
-                .map(|&(_, d)| d),
-            _ => None,
-        };
+    for ((dir, path, t, _), keep) in incremental.into_iter().zip(keep_dir) {
         let c = Candidate {
             krate: None,
+            value: None,
+            inodes: Vec::new(),
             id: format!("inc:{dir}"),
             paths: vec![path],
             mtime: t,
             incremental: true,
         };
-        // no unit of that crate left (removed crate) or its unit is going away
-        if nearest.unwrap_or(true) {
-            inc_doomed.push(c)
-        } else {
+        if keep {
             inc_kept.push(c)
+        } else {
+            inc_doomed.push(c)
         }
     }
     doomed.extend(inc_doomed);

@@ -1,7 +1,7 @@
 //! Collect units (everything sharing one metadata hash) and incremental dirs of a profile.
 
 use crate::fingerprint::{json_signature, parse_fingerprint_json, parse_le_hex};
-use crate::fsutil::{mtime, read_dir};
+use crate::fsutil::{inode, mtime, read_dir};
 use crate::layout::{out_kind, split_hash, STATE_DIR, TAGS_DIR};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -18,9 +18,11 @@ pub(crate) struct Unit {
     pub(crate) rustc: u64,  // hash of `rustc -vV` (differs between toolchains)
     pub(crate) sig: String, // fingerprint json minus deps/local/path: features, profile, rustflags, ...
     pub(crate) tag: String, // workspace wrapper that built it (clippy-driver), from TAGS_DIR
-    pub(crate) krate: Option<String>, // rustc crate name (stem of `deps/<crate>-H.d`), for incremental dirs
-    pub(crate) fp_value: Option<u64>, // this unit's fingerprint value
-    pub(crate) dep_values: Vec<u64>,  // fingerprint values of its dependencies
+    pub(crate) krate: Option<String>,
+    pub(crate) dep_info: Option<PathBuf>, // rustc dep-info (`deps/<crate>-H.d`, build script's `.d`) // rustc crate name (stem of `deps/<crate>-H.d`), for incremental dirs
+    pub(crate) fp_value: Option<u64>,     // this unit's fingerprint value
+    pub(crate) dep_values: Vec<u64>,      // fingerprint values of its dependencies
+    pub(crate) inodes: Vec<u64>, // of `.rmeta` / `.rcgu.o` files, shared with incremental sessions
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) mtime: Option<SystemTime>,
 }
@@ -46,7 +48,8 @@ impl Unit {
     }
 }
 
-pub(crate) type Incremental = Vec<(String, PathBuf, Option<SystemTime>)>;
+/// `incremental/<crate>-<id>` dirs: name, path, mtime, inodes of their session files.
+pub(crate) type Incremental = Vec<(String, PathBuf, Option<SystemTime>, Vec<u64>)>;
 
 pub(crate) fn scan(profile: &Path, with_sig: bool) -> (BTreeMap<String, Unit>, Incremental) {
     let mut units: BTreeMap<String, Unit> = BTreeMap::new();
@@ -89,6 +92,7 @@ pub(crate) fn scan(profile: &Path, with_sig: bool) -> (BTreeMap<String, Unit>, I
         }
         if path.join("build-script-build").exists() {
             u.krate = Some("build_script_build".to_owned());
+            u.dep_info = Some(path.join(format!("build_script_build-{h}.d")));
         }
         u.touch(mtime(&path));
         u.paths.push(path);
@@ -105,8 +109,12 @@ pub(crate) fn scan(profile: &Path, with_sig: bool) -> (BTreeMap<String, Unit>, I
             if let Some(k) = out_kind(rest, &path) {
                 u.out_kind.insert(k);
             }
+            if rest == ".rmeta" || rest.ends_with(".rcgu.o") {
+                u.inodes.extend(inode(&path));
+            }
             if rest == ".d" {
                 u.krate = Some(stem.to_owned());
+                u.dep_info = Some(path.clone());
             }
             u.touch(mtime(&path));
             u.paths.push(path);
@@ -117,7 +125,14 @@ pub(crate) fn scan(profile: &Path, with_sig: bool) -> (BTreeMap<String, Unit>, I
         .filter(|(n, p)| n.contains('-') && p.is_dir())
         .map(|(n, p)| {
             let t = mtime(&p);
-            (n, p, t)
+            let inodes = read_dir(&p)
+                .into_iter()
+                .filter(|(s, q)| s.starts_with("s-") && q.is_dir())
+                .flat_map(|(_, q)| read_dir(&q))
+                .filter(|(f, _)| f.ends_with(".o") || f == "metadata.rmeta")
+                .filter_map(|(_, f)| inode(&f))
+                .collect();
+            (n, p, t, inodes)
         })
         .collect();
     (units, incremental)

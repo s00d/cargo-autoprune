@@ -32,13 +32,8 @@ fn dependency_version_bump() {
     let ws = Ws::new("bump");
     step(&ws, A10, CMDS);
     step(&ws, A11, CMDS);
-    // revert right away (inside the pin window): old copies may stay pinned, nothing live is lost
-    ws.deps(A10);
-    ws.run_all(CMDS);
-    ws.prune();
-    let (_, lost) = ws.oracle_diff(CMDS);
-    assert!(lost.is_empty(), "{lost:#?}");
-    assert_eq!(ws.run_all(CMDS), 0);
+    step(&ws, A10, CMDS); // quick revert: one comeback is not a pin
+    assert_eq!(ws.pins(), 0);
 }
 
 #[test]
@@ -283,13 +278,14 @@ fn background_prune_waits_for_the_build_and_cleans_after_it() {
     let built = t0.elapsed();
     let log = ws.target.join("debug/.autoprune/log");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline
-        && ws
-            .deps_files("debug", "libdep_a-")
-            .iter()
-            .filter(|f| f.ends_with(".rlib"))
-            .count()
-            > 1
+    while Instant::now() < deadline && !log.exists()
+        || Instant::now() < deadline
+            && ws
+                .deps_files("debug", "libdep_a-")
+                .iter()
+                .filter(|f| f.ends_with(".rlib"))
+                .count()
+                > 1
     {
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -368,6 +364,111 @@ fn cli_dry_run_and_prune() {
         1
     );
     assert_eq!(ws.cargo(CMDS[0]), 0);
+}
+
+#[test]
+fn custom_profile_and_explicit_target_triple() {
+    let ws = Ws::new("triple");
+    ws.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"util\"]\nresolver = \"2\"\n[profile.ci]\ninherits = \"dev\"\nopt-level = 1\n",
+    );
+    let host = host_triple();
+    let t = format!("build --workspace --target {host}");
+    let cmds = [
+        "build --workspace --profile ci",
+        t.as_str(),
+        "check --workspace",
+    ];
+    step(&ws, &format!("{A10}\ndep_b = \"1\""), &cmds);
+    step(&ws, &format!("{A11}\ndep_b = \"1\""), &cmds);
+    let profiles = cargo_autoprune::layout::profile_dirs(&ws.target);
+    assert!(profiles.iter().any(|p| p.ends_with("ci")), "{profiles:?}");
+    assert!(
+        profiles
+            .iter()
+            .any(|p| p.ends_with(format!("{host}/debug"))),
+        "{profiles:?}"
+    );
+}
+
+#[test]
+fn rustflags_change() {
+    let ws = Ws::new("rustflags");
+    let cmds = &CMDS[..2];
+    ws.deps(A10);
+    ws.run_all(cmds);
+    ws.prune();
+    // same commands with RUSTFLAGS: compare against an oracle built with the same flags
+    let env = [("RUSTFLAGS", "-C debug-assertions=off")];
+    for c in cmds {
+        ws.cargo_in(c, &ws.target.clone(), true, &env);
+    }
+    ws.prune();
+    let oracle = ws.root.join("oracle-flags");
+    for c in cmds {
+        ws.cargo_in(c, &oracle, false, &env);
+    }
+    let (a, b) = (inventory(&ws.target), inventory(&oracle));
+    let lost: Vec<_> = b.difference(&a).collect();
+    assert!(lost.is_empty(), "{lost:#?}");
+    for c in cmds {
+        assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &env), 0);
+    }
+}
+
+#[test]
+fn removed_workspace_member_and_renamed_bin() {
+    let ws = Ws::new("member");
+    ws.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"util\", \"tool\"]\nresolver = \"2\"\n",
+    );
+    ws.write("tool/Cargo.toml", "[package]\nname = \"tool\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep_c = \"1\"\n");
+    ws.write("tool/src/main.rs", "fn main() { dep_c::c(); }\n");
+    step(&ws, A10, CMDS);
+    assert!(!ws.deps_files("debug", "tool-").is_empty());
+    ws.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"util\"]\nresolver = \"2\"\n",
+    );
+    ws.write("app/src/main.rs", "fn main() {}\n");
+    fs::rename(
+        ws.dir.join("app/src/main.rs"),
+        ws.dir.join("app/src/bin_renamed.rs"),
+    )
+    .unwrap();
+    fs::create_dir_all(ws.dir.join("app/src/bin")).unwrap();
+    fs::rename(
+        ws.dir.join("app/src/bin_renamed.rs"),
+        ws.dir.join("app/src/bin/renamed.rs"),
+    )
+    .unwrap();
+    ws.run_all(CMDS);
+    ws.prune();
+    let (left, lost) = ws.oracle_diff(CMDS);
+    assert!(lost.is_empty(), "{lost:#?}");
+    // uplifted outputs of the gone binaries in the profile root are a documented limitation
+    let left: Vec<_> = left
+        .into_iter()
+        .filter(|f| {
+            !f.starts_with("debug/app")
+                && !f.starts_with("debug/tool")
+                && !f.starts_with("release/app")
+        })
+        .collect();
+    assert!(left.is_empty(), "{left:#?}");
+    assert!(ws.deps_files("debug", "tool-").is_empty());
+    assert!(ws.deps_files("debug", "libdep_c-").is_empty());
+}
+
+fn host_triple() -> String {
+    let out = Command::new("rustc").arg("-vV").output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .unwrap()
+        .to_owned()
 }
 
 fn dir_size(p: &std::path::Path) -> u64 {

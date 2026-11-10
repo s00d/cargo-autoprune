@@ -1,15 +1,87 @@
 //! Reading Cargo's `.fingerprint/*/*.json` and the workspace `Cargo.lock`.
 
+use crate::fsutil::read_dir;
+use crate::layout::profile_dirs;
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The workspace that owns a target dir: its root and its path (non-registry) packages.
+pub(crate) struct Workspace {
+    pub(crate) root: PathBuf,
+    pub(crate) locals: HashSet<String>,
+}
+
+impl Workspace {
+    pub(crate) fn is_local(&self, pkg: &str) -> bool {
+        self.locals.contains(pkg)
+    }
+
+    /// The crate root source named first in a rustc dep-info file is gone: the target
+    /// (bin, test, example, build script) was removed or renamed.
+    pub(crate) fn target_removed(&self, dep_info: &Path) -> bool {
+        let Some(root) = fs::read_to_string(dep_info)
+            .ok()
+            .and_then(|t| first_dependency(&t))
+        else {
+            return false;
+        };
+        !self.root.join(root).exists() // join keeps absolute paths as they are
+    }
+}
+
+/// First prerequisite of the first rule in a make-style dep-info file (`out: src/main.rs ...`).
+pub(crate) fn first_dependency(text: &str) -> Option<String> {
+    let (_, deps) = text.lines().next()?.split_once(": ")?;
+    let mut out = String::new();
+    let mut esc = false;
+    for ch in deps.chars() {
+        match ch {
+            _ if esc => {
+                out.push(ch);
+                esc = false;
+            }
+            '\\' if !cfg!(windows) => esc = true,
+            ' ' if !out.is_empty() => break,
+            ' ' => {}
+            _ => out.push(ch),
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Dependency fingerprint values of every unit in the *other* profile dirs of the same target:
+/// with `--target`, build scripts and proc-macros live in the host profile but are used from
+/// `<triple>/<profile>`.
+pub(crate) fn sibling_dep_values(profile: &Path) -> Vec<u64> {
+    let Some(target) = profile
+        .ancestors()
+        .find(|a| a.join("CACHEDIR.TAG").is_file())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for p in profile_dirs(target).into_iter().filter(|p| p != profile) {
+        for (_, unit) in read_dir(&p.join(".fingerprint")) {
+            for (name, f) in read_dir(&unit) {
+                if name.ends_with(".json") {
+                    out.extend(
+                        parse_fingerprint_json(&fs::read_to_string(f).unwrap_or_default()).1,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Package names without a `source` in the workspace `Cargo.lock` next to the target dir.
-pub(crate) fn local_packages(profile: &Path) -> Option<HashSet<String>> {
+pub(crate) fn workspace(profile: &Path) -> Option<Workspace> {
     let target = profile
         .ancestors()
         .find(|a| a.join("CACHEDIR.TAG").is_file())?;
-    let lock = fs::read_to_string(target.parent()?.join("Cargo.lock")).ok()?;
+    let root = target.parent()?;
+    let lock = fs::read_to_string(root.join("Cargo.lock")).ok()?;
     let mut out = HashSet::new();
     for pkg in lock.split("[[package]]").skip(1) {
         let name = pkg
@@ -21,7 +93,10 @@ pub(crate) fn local_packages(profile: &Path) -> Option<HashSet<String>> {
             out.insert(name.to_owned());
         }
     }
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty()).then(|| Workspace {
+        root: root.to_path_buf(),
+        locals: out,
+    })
 }
 
 /// `rustc` hash and dependency fingerprint values from a fingerprint json:
@@ -77,6 +152,20 @@ pub(crate) fn parse_le_hex(h: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dep_info_first_dependency() {
+        assert_eq!(
+            first_dependency("/t/deps/app-1.d: app/src/main.rs Cargo.toml\n\napp/src/main.rs:\n")
+                .as_deref(),
+            Some("app/src/main.rs")
+        );
+        assert_eq!(
+            first_dependency("/t/x: /a\\ b/lib.rs /c.rs").as_deref(),
+            Some("/a b/lib.rs")
+        );
+        assert_eq!(first_dependency("/t/x:"), None);
+    }
 
     #[test]
     fn fingerprint_json_parsing() {

@@ -1,6 +1,6 @@
 //! One prune pass over a profile dir: lock, scan, plan, delete, record.
 
-use crate::fingerprint::local_packages;
+use crate::fingerprint::{sibling_dep_values, workspace};
 use crate::fsutil::size_of;
 use crate::layout::{is_profile_dir, STATE_DIR, TAGS_DIR};
 use crate::lock::{acquire_cargo_locks, lock_file};
@@ -92,16 +92,16 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     let deleted_before = read_deleted(&state.join("deleted"), now);
     let mut pinned = read_pins(&state.join("pinned"), now);
     let mut suspects = read_pins(&state.join("suspects"), now);
-    let locals = local_packages(profile);
-    let (units, incremental) = scan(profile, locals.is_some());
+    let ws = workspace(profile);
+    let (units, incremental) = scan(profile, ws.is_some());
 
     let mut report = Report::default();
     // A deleted unit was rebuilt. Once is a revert; a second comeback in the same group means two
     // live variants alternate (`-p x` vs `--workspace` feature unification): pin the group.
     for (h, u) in &units {
-        let local = locals
+        let local = ws
             .as_ref()
-            .is_none_or(|l| l.contains(u.name.as_deref().unwrap_or("")));
+            .is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
         if u.has_fingerprint
             && local
             && deleted_before.contains_key(h.as_str())
@@ -115,7 +115,8 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
             }
         }
     }
-    let (doomed, kept) = plan(units, incremental, &pinned, locals.as_ref(), cfg);
+    let extra_roots = sibling_dep_values(profile);
+    let (doomed, kept) = plan(units, incremental, &pinned, ws.as_ref(), extra_roots, cfg);
     let doomed = apply_cap(doomed, kept, cfg.max_size);
 
     let mut new_deleted = Vec::new();
@@ -350,6 +351,27 @@ mod tests {
         assert!(fx.exists(&format!("deps/libtokio-{A}.rlib")));
         assert!(fx.exists(&format!("deps/libtokio-{B}.rlib")));
         assert_eq!(fx.run(&cfg()).removed_units, 0); // pin persists
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn incremental_owner_by_hard_link() {
+        let fx = Fx::new("inclink");
+        fx.lib("app", A, 10, false);
+        fx.lib("app", B, 7200, false); // superseded
+                                       // both dirs written at the same moment: only the hard links tell the owners apart
+        for (d, h) in [("app-1aaa", B), ("app-2bbb", A)] {
+            fx.dir(&format!("incremental/{d}/s-x"), 5);
+            fs::hard_link(
+                fx.prof.join(format!("deps/libapp-{h}.rmeta")),
+                fx.prof.join(format!("incremental/{d}/s-x/metadata.rmeta")),
+            )
+            .unwrap();
+            set_age(&fx.prof.join(format!("incremental/{d}")), 5);
+        }
+        let r = fx.run(&cfg());
+        assert_eq!(r.removed_incremental, 1);
+        assert!(!fx.exists("incremental/app-1aaa") && fx.exists("incremental/app-2bbb"));
     }
 
     #[test]

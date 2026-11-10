@@ -5,6 +5,17 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Inode number (unix); incremental work products are hard links to `deps/` files.
+#[cfg(unix)]
+pub(crate) fn inode(p: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(p).ok().map(|m| m.ino())
+}
+#[cfg(not(unix))]
+pub(crate) fn inode(_: &Path) -> Option<u64> {
+    None
+}
+
 pub(crate) fn mtime(p: &Path) -> Option<SystemTime> {
     fs::symlink_metadata(p).and_then(|m| m.modified()).ok()
 }

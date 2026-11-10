@@ -1,5 +1,17 @@
 # cargo-autoprune
 
+[![Crates.io](https://img.shields.io/crates/v/cargo-autoprune?style=for-the-badge)](https://crates.io/crates/cargo-autoprune)
+[![Downloads](https://img.shields.io/crates/d/cargo-autoprune?style=for-the-badge)](https://crates.io/crates/cargo-autoprune)
+[![docs.rs](https://img.shields.io/badge/docs-docs.rs-blue?style=for-the-badge)](https://docs.rs/cargo-autoprune)
+[![CI](https://img.shields.io/github/actions/workflow/status/s00d/cargo-autoprune/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/s00d/cargo-autoprune/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/s00d/cargo-autoprune?style=for-the-badge)](https://github.com/s00d/cargo-autoprune/releases)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89-blue?style=for-the-badge)](https://github.com/s00d/cargo-autoprune/blob/main/Cargo.toml)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue?style=for-the-badge)](https://github.com/s00d/cargo-autoprune/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](https://github.com/s00d/cargo-autoprune/blob/main/LICENSE)
+[![GitHub issues](https://img.shields.io/github/issues/s00d/cargo-autoprune?style=for-the-badge)](https://github.com/s00d/cargo-autoprune/issues)
+[![GitHub stars](https://img.shields.io/github/stars/s00d/cargo-autoprune?style=for-the-badge)](https://github.com/s00d/cargo-autoprune/stargazers)
+[![Donate](https://img.shields.io/badge/Donate-Donationalerts-ff4081?style=for-the-badge)](https://www.donationalerts.com/r/s00d88)
+
 Cargo never deletes superseded build artifacts. Every dependency bump, feature flip, `check` vs
 `build`, or `-p x --features y` run gives units a new hash in `target/<profile>/{deps,.fingerprint,build,incremental}`,
 and the old copies stay there forever. A busy workspace easily grows `target/` to 50+ GB.

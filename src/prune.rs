@@ -89,7 +89,7 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     let start = Instant::now(); // prune time only, not the wait for cargo
 
     let now = SystemTime::now();
-    let deleted_before = read_deleted(&state.join("deleted"), now);
+    let mut deleted_before = read_deleted(&state.join("deleted"), now);
     let mut pinned = read_pins(&state.join("pinned"), now);
     let mut suspects = read_pins(&state.join("suspects"), now);
     let ws = workspace(profile);
@@ -104,7 +104,7 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
             .is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
         if u.has_fingerprint
             && local
-            && deleted_before.contains_key(h.as_str())
+            && deleted_before.remove(h.as_str()).is_some() // a comeback counts once
             && !pinned.contains_key(&u.group())
         {
             if suspects.remove(&u.group()).is_some() {

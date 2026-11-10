@@ -218,6 +218,12 @@ impl Ws {
         assert!(lost.is_empty(), "live files were deleted: {lost:#?}");
         assert!(left.is_empty(), "garbage left: {left:#?}");
         assert_eq!(self.run_all(cmds), 0, "rerun recompiled units");
+        let again: usize = self
+            .prune()
+            .iter()
+            .map(|r| r.removed_units + r.removed_incremental)
+            .sum();
+        assert_eq!(again, 0, "a second prune still found garbage");
     }
 
     /// Age the recent-deletion log so the next rebuild looks like a revert done later.
@@ -325,6 +331,21 @@ pub fn inventory(target: &Path) -> BTreeSet<String> {
         }
     }
     out
+}
+
+/// Move every mtime under `p` back by `secs` (simulates time passing).
+pub fn age_tree(p: &Path, secs: u64) {
+    let Ok(m) = fs::symlink_metadata(p) else {
+        return;
+    };
+    if m.is_dir() {
+        for e in fs::read_dir(p).unwrap() {
+            age_tree(&e.unwrap().path(), secs);
+        }
+    }
+    if let (Ok(t), Ok(f)) = (m.modified(), fs::File::open(p)) {
+        let _ = f.set_modified(t - Duration::from_secs(secs));
+    }
 }
 
 pub fn now_secs() -> u64 {

@@ -134,6 +134,7 @@ fn feature_unification_alternation_is_pinned_not_thrashed() {
 #[test]
 fn check_build_test_release_and_doc() {
     let cmds = &[
+        "bench --workspace --no-run",
         "check --workspace --all-targets",
         "doc --workspace --no-deps",
         "build --examples",
@@ -460,6 +461,63 @@ fn removed_workspace_member_and_renamed_bin() {
     assert!(left.is_empty(), "{left:#?}");
     assert!(ws.deps_files("debug", "tool-").is_empty());
     assert!(ws.deps_files("debug", "libdep_c-").is_empty());
+}
+
+#[test]
+fn toolchain_switch_and_retirement() {
+    let Some(old) = other_toolchain_rustc() else {
+        eprintln!("no second toolchain installed, skipped");
+        return;
+    };
+    let ws = Ws::new("toolchain");
+    let cmds = &CMDS[..2];
+    let with_old = |ws: &Ws| {
+        let target = ws.target.clone();
+        cmds.iter()
+            .map(|c| ws.cargo_in(c, &target, true, &[("RUSTC", old.as_str())]))
+            .sum::<usize>()
+    };
+    ws.deps(A10);
+    with_old(&ws);
+    ws.run_all(cmds);
+    ws.prune();
+    // both toolchains stay usable side by side
+    assert_eq!(with_old(&ws), 0);
+    assert_eq!(ws.run_all(cmds), 0);
+    // three weeks without the old toolchain: its units are retired, the current ones stay
+    age_tree(&ws.target, 21 * 24 * 3600);
+    ws.write("util/src/lib.rs", "pub fn u() -> u32 { 3 }\n");
+    ws.run_all(cmds);
+    ws.prune();
+    ws.assert_clean(cmds);
+}
+
+fn other_toolchain_rustc() -> Option<String> {
+    let current = String::from_utf8(Command::new("rustc").arg("-V").output().ok()?.stdout).ok()?;
+    let list = String::from_utf8(
+        Command::new("rustup")
+            .args(["toolchain", "list"])
+            .output()
+            .ok()?
+            .stdout,
+    )
+    .ok()?;
+    for tc in list.lines().filter_map(|l| l.split_whitespace().next()) {
+        let host = host_triple();
+        if !tc.ends_with(&host) || tc.starts_with("nightly") {
+            continue;
+        }
+        let out = Command::new("rustup")
+            .args(["which", "rustc", "--toolchain", tc])
+            .output()
+            .ok()?;
+        let rustc = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+        let v = Command::new(&rustc).arg("-V").output().ok()?;
+        if v.status.success() && String::from_utf8_lossy(&v.stdout) != current {
+            return Some(rustc);
+        }
+    }
+    None
 }
 
 fn host_triple() -> String {

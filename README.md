@@ -184,21 +184,26 @@ until the size cap evicts them.
 
 ## Comparison
 
-**Head to head on a real workspace.** The test project is vld: 695 crates, a 5 GB target.
-Scenario: bump `itoa` in `Cargo.lock`, build, prune, then compare with a target built from scratch
-and rebuild.
+**Head to head on a real workspace: cargo-autoprune wins on every row.** The test project is vld:
+695 crates, a 5 GB target. Scenario: bump `itoa` in `Cargo.lock`, build, prune, then
+1. compare the target with one built from scratch, and
+2. build again.
+
+cargo-sweep frees a little less, leaves garbage, and deletes artifacts the current build still
+uses, so the next build recompiles the whole workspace. cargo-autoprune leaves exactly what a clean
+build would produce, and the next build compiles nothing.
 
 | | cargo-autoprune | cargo-sweep 0.8 (`--stamp` / `--file`) |
 |---|---|---|
-| freed | 3.0 GiB | 2.85 GiB |
-| garbage left (vs from-scratch target) | **0** | 196 files |
-| live files deleted | **0** | **2,799 files** |
-| next build | **0 crates** | **694 of 695 crates (full rebuild)** |
-| scan (dry run, warm) | 0.18–0.21 s | 0.47–0.74 s |
-| safe with a running cargo | yes (cargo's locks, 1 s batches) | no lock |
+| Space freed (more is better) | ✅ **3.0 GiB** | 2.85 GiB |
+| Garbage left behind (fewer is better) | ✅ **0 files** | 196 files |
+| Live files wrongly deleted (fewer is better) | ✅ **0** | 2,799 |
+| Crates the next build recompiles (fewer is better) | ✅ **0** | 694 of 695 (full rebuild) |
+| Scan time, dry run (less is better) | ✅ **0.18–0.21 s** | 0.47–0.74 s |
+| Safe while cargo runs | ✅ yes: takes cargo's locks, waits for the cargo command to end, 1 s batches | no |
 
-cargo-sweep's stamp mode trusts access times. On macOS (and on Linux with `noatime`) cargo doesn't
-update them for files it only checks, so live artifacts look unused.
+cargo-sweep's stamp mode trusts access times. cargo doesn't update them for files it only checks
+(and macOS or Linux with `noatime` don't track them at all), so live artifacts look unused.
 
 All tools:
 

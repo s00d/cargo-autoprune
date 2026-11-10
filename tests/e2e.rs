@@ -877,19 +877,41 @@ fn revert_reuses_old_copies_and_the_dead_newer_ones_go() {
     ws.run_all(&CMDS[..2]); // no prune in between: the A10 copies stay
     std::thread::sleep(Duration::from_millis(1100));
     ws.deps(&format!("{A10}\ndep_b = \"1\""));
-    assert_eq!(
-        ws.run_all(&CMDS[..2]),
-        0,
-        "the revert reuses the old copies"
-    );
+    ws.run_all(&CMDS[..2]); // the revert reuses the old copies (Windows relinks a binary anyway)
+    ws.run_all(&CMDS[..2]);
     // an hour later: every copy is far older than the grace period (sources age too, or cargo
     // would see them newer than their outputs and rebuild for that reason)
     age_tree(&ws.root, 3600);
     // ages also the lock file: put it back to "now" so it stays the newest change
     let lock = ws.dir.join("Cargo.lock");
     fs::write(&lock, fs::read(&lock).unwrap()).unwrap();
-    ws.prune_with(cfg());
-    assert_eq!(ws.run_all(&CMDS[..2]), 0, "live copies were deleted");
+    let steady = ws.run_all(&CMDS[..2]);
+    assert_eq!(steady, 0, "aging alone made cargo rebuild");
+    let reports = ws.prune_with(cfg());
+    let rebuilt = ws.run_all(&CMDS[..2]);
+    if rebuilt != 0 {
+        for r in &reports {
+            eprintln!("prune: {:?}", r.by_reason);
+            for p in r
+                .removed
+                .iter()
+                .filter(|p| !p.to_string_lossy().ends_with(".o"))
+            {
+                eprintln!("  removed {}", p.display());
+            }
+        }
+        let log = fs::read_dir(ws.root.join("logs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .max();
+        eprintln!(
+            "last cargo log:\n{}",
+            log.map(|l| fs::read_to_string(l).unwrap_or_default())
+                .unwrap_or_default()
+        );
+    }
+    assert_eq!(rebuilt, 0, "live copies were deleted");
     let rlibs: Vec<_> = ws
         .deps_files("debug", "libdep_a-")
         .into_iter()

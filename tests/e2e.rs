@@ -130,13 +130,23 @@ fn feature_unification_alternation_is_pinned_not_thrashed() {
     let a = "build -p app --all-targets";
     let w = "build --workspace --all-targets";
     let mut compiled = Vec::new();
+    let control = ws.root.join("control");
+    let mut baseline = Vec::new();
     for _ in 0..3 {
         compiled.push(ws.cargo(a));
         ws.prune();
         compiled.push(ws.cargo(w));
         ws.prune();
+        // the same commands without any pruning: what cargo rebuilds by itself (on Windows a
+        // binary's unhashed deps/<bin>.exe is shared by both variants and relinks every time)
+        baseline.push(ws.cargo_in(a, &control, true, &[]));
+        baseline.push(ws.cargo_in(w, &control, true, &[]));
     }
-    assert_eq!(&compiled[4..], &[0, 0], "still thrashing: {compiled:?}");
+    assert_eq!(
+        &compiled[4..],
+        &baseline[4..],
+        "still thrashing: {compiled:?} vs cargo alone {baseline:?}"
+    );
     assert!(ws.pins() > 0);
 }
 
@@ -232,9 +242,10 @@ fn size_cap_evicts_oldest_but_builds_still_work() {
         lock_wait: Duration::from_secs(60),
         ..Config::default()
     });
-    // the cap counts unit files; a few profile files belong to no unit (Linux: ~6%)
+    // the cap counts unit files; some profile files belong to no unit (Linux ~6%, Windows ~13%:
+    // unhashed deps/<bin>.exe and .pdb copies)
     assert!(
-        dir_size(&debug) <= cap + cap / 10,
+        dir_size(&debug) <= cap + cap / 4,
         "{} > {cap}",
         dir_size(&debug)
     );
@@ -497,6 +508,8 @@ fn removed_workspace_member_and_renamed_bin() {
             !f.starts_with("debug/app")
                 && !f.starts_with("debug/tool")
                 && !f.starts_with("release/app")
+                // Windows: unhashed copies deps/<bin>.exe/.pdb/.d, same limitation
+                && !(f.contains("/deps/app.") || f.contains("/deps/tool."))
         })
         .collect();
     assert!(left.is_empty(), "{left:#?}");
@@ -624,10 +637,22 @@ fn two_workspaces_share_one_target_dir() {
     let a = Ws::new("share-a");
     let b = Ws::new("share-b");
     let shared = a.root.join("shared-target");
-    let all = |ws: &Ws| -> usize {
-        CMDS.iter()
+    // every build also goes into a control target that is never pruned: what cargo rebuilds by
+    // itself in a shared target (Windows relinks same-named binaries: deps/<bin>.exe is shared)
+    let control = a.root.join("control-target");
+    let all = |ws: &Ws| -> (usize, usize) {
+        let ours = CMDS
+            .iter()
             .map(|c| ws.cargo_in(c, &shared, true, &[]))
-            .sum()
+            .sum();
+        let ctl = CMDS
+            .iter()
+            .map(|c| ws.cargo_in(c, &control, true, &[]))
+            .sum();
+        (ours, ctl)
+    };
+    let same = |(ours, ctl): (usize, usize), what: &str| {
+        assert_eq!(ours, ctl, "{what}: rebuilt {ours}, cargo alone {ctl}")
     };
     let prune_all = || {
         for p in cargo_autoprune::layout::profile_dirs(&shared) {
@@ -646,8 +671,8 @@ fn two_workspaces_share_one_target_dir() {
     all(&a);
     all(&b);
     prune_all();
-    assert_eq!(all(&a), 0, "workspace a lost units");
-    assert_eq!(all(&b), 0, "workspace b lost units");
+    same(all(&a), "workspace a lost units");
+    same(all(&b), "workspace b lost units");
     a.deps(A10); // dep_b removed from a: no Cargo.lock next to the shared target, roots recorded
     all(&a);
     prune_all();
@@ -657,8 +682,8 @@ fn two_workspaces_share_one_target_dir() {
         .filter(|n| n.starts_with("libdep_b-"))
         .collect();
     assert!(left.is_empty(), "removed dependency kept: {left:?}");
-    assert_eq!(all(&a), 0);
-    assert_eq!(all(&b), 0);
+    same(all(&a), "a after the prune");
+    same(all(&b), "b after the prune");
 }
 
 fn oracle_rebuild(ws: &Ws, cmds: &[&str], env: &[(&str, &str)]) -> std::path::PathBuf {

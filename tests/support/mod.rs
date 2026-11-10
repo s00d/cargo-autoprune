@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_cargo-autoprune");
+/// A cargo command in a test that runs longer than this is reported with a process dump.
+const CARGO_TIMEOUT: Duration = Duration::from_secs(240);
 
 pub struct Ws {
     pub root: PathBuf,
@@ -164,19 +166,44 @@ impl Ws {
     ) -> usize {
         let mut c = self.command_with(args, target, wrapper, envs);
         c.envs(envs.iter().copied());
-        let out = c.output().expect("run cargo");
         let n = self.n.fetch_add(1, Ordering::SeqCst);
         let log = self
             .logs
             .join(format!("{n:03}-{}.log", args.replace([' ', '/'], "_")));
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        fs::write(&log, &text).unwrap();
+        // output goes to a file, not a pipe: the test must not depend on who keeps a pipe open
+        let file = fs::File::create(&log).unwrap();
+        c.stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .stdin(std::process::Stdio::null());
+        let mut child = c.spawn().expect("run cargo");
+        let deadline = std::time::Instant::now() + CARGO_TIMEOUT;
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() > deadline {
+                let ps = Command::new("ps")
+                    .args(["-axo", "pid,ppid,pgid,stat,etime,command"])
+                    .output();
+                let ps = ps
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default();
+                let ps: Vec<&str> = ps
+                    .lines()
+                    .filter(|l| l.contains("cargo") || l.contains("rustc"))
+                    .collect();
+                let _ = child.kill();
+                panic!(
+                    "cargo {args} still running after {CARGO_TIMEOUT:?}\n{}\nprocesses:\n{}",
+                    fs::read_to_string(&log).unwrap_or_default(),
+                    ps.join("\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let text = fs::read_to_string(&log).unwrap_or_default();
         assert!(
-            out.status.success(),
+            status.success(),
             "cargo {args} failed, log: {}\n{text}",
             log.display()
         );

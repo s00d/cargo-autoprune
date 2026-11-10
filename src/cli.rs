@@ -1,7 +1,7 @@
 //! `cargo autoprune [--dry-run] [--max-size SIZE] [--grace SECS] [DIR]`.
 
 use crate::fsutil::{entries, human, parse_size, size_of};
-use crate::layout::{is_profile_dir, profile_dirs, STATE_DIR};
+use crate::layout::{find_target_dirs, is_profile_dir, profile_dirs, STATE_DIR};
 use crate::prune::{prune, Config, Outcome};
 use crate::state::read_notices;
 use std::env;
@@ -18,10 +18,16 @@ Install once, then every build keeps target/ trim:
                          rustc-wrapper = \"cargo-autoprune\"
 
 Manual run:
-  cargo autoprune [--dry-run] [--verbose] [--max-size SIZE] [--grace SECS] [DIR]
-    DIR        profile, target or project dir (default: $CARGO_TARGET_DIR or ./target)
-    --dry-run  print what would be removed
-    --verbose  list removed paths and phase timings
+  cargo autoprune [OPTIONS] [DIR...]
+    DIR                 profile, target or project dir (default: $CARGO_TARGET_DIR or ./target)
+    -n, --dry-run       print what would be removed
+    -v, --verbose       list removed paths and phase timings
+    --max-size SIZE     cap each profile dir, e.g. 20G (oldest units go first)
+    --grace SECS        keep variants built within SECS of the newest (default 600)
+    -r, --recursive     find every Cargo target dir under DIR... (servers, runners, ~/projects)
+    --remove-idle DAYS  with -r: delete whole target dirs nothing was compiled into for DAYS
+    --drop-incremental  also delete all incremental dirs
+    --ci                --grace 0 --drop-incremental: trim target/ before a CI cache is saved
   cargo autoprune status [DIR]
     size, reclaimable space, last prune, pinned groups, notices, whether the wrapper is set up
 
@@ -53,6 +59,55 @@ fn resolve_profiles(dir: Option<PathBuf>) -> Vec<PathBuf> {
         die(&format!("no Cargo profile dirs under {}", dir.display()));
     }
     profiles
+}
+
+/// `--remove-idle DAYS`: delete a whole target dir when nothing was compiled into it for DAYS
+/// (newest fingerprint dir). Skipped while any of its profiles is locked by a running cargo.
+fn remove_if_idle(target: &std::path::Path, days: u64, dry_run: bool) -> bool {
+    let profiles = profile_dirs(target);
+    let newest = profiles
+        .iter()
+        .flat_map(|p| [p.join(".fingerprint"), p.join(".autoprune").join("log")])
+        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max();
+    let idle = newest
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age.as_secs() >= days * 86400);
+    if !idle {
+        return false;
+    }
+    let size = human(size_of(target));
+    if dry_run {
+        println!(
+            "{}: idle for {days}+ days, would remove the whole dir ({size})",
+            target.display()
+        );
+        return true;
+    }
+    let mut held = Vec::new();
+    for p in &profiles {
+        match crate::lock::acquire_cargo_locks(p, Duration::ZERO) {
+            Ok(Some(l)) => held.push(l),
+            _ => {
+                println!(
+                    "{}: idle but locked by a running cargo, kept",
+                    target.display()
+                );
+                return false;
+            }
+        }
+    }
+    if cfg!(windows) {
+        drop(held); // open files can't be deleted there
+    }
+    match fs::remove_dir_all(target) {
+        Ok(()) => println!(
+            "{}: idle for {days}+ days, removed ({size})",
+            target.display()
+        ),
+        Err(e) => eprintln!("{}: {e}", target.display()),
+    }
+    true
 }
 
 /// A size cap from the user. Tiny values are refused: `--max-size 20` (bytes, meant 20G) would
@@ -186,8 +241,10 @@ fn now_secs() -> u64 {
 pub fn run(args: &[OsString]) {
     let mut cfg = Config::from_env();
     cfg.lock_wait = Duration::from_secs(600);
-    let mut dir: Option<PathBuf> = None;
+    let mut dirs: Vec<PathBuf> = Vec::new();
     let mut verbose = false;
+    let mut recursive = false;
+    let mut remove_idle: Option<u64> = None;
     let mut it = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -219,11 +276,45 @@ pub fn run(args: &[OsString]) {
                     .unwrap_or_else(|_| die(&format!("--grace takes seconds, got {v:?}")));
                 cfg.grace = Duration::from_secs(secs);
             }
+            "-r" | "--recursive" => recursive = true,
+            "--drop-incremental" => cfg.drop_incremental = true,
+            "--ci" => {
+                cfg.grace = Duration::ZERO;
+                cfg.drop_incremental = true;
+            }
+            "--remove-idle" => {
+                let v = it.next().unwrap_or_default();
+                let days = v
+                    .parse()
+                    .unwrap_or_else(|_| die(&format!("--remove-idle takes days, got {v:?}")));
+                remove_idle = Some(days);
+            }
             _ if a.starts_with('-') => die(&format!("unknown option {a}\n\n{HELP}")),
-            _ => dir = Some(PathBuf::from(a)),
+            _ => dirs.push(PathBuf::from(a)),
         }
     }
-    let profiles = resolve_profiles(dir);
+    let mut profiles = Vec::new();
+    if recursive {
+        let roots = if dirs.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            dirs
+        };
+        let mut targets: Vec<PathBuf> = roots.iter().flat_map(|r| find_target_dirs(r)).collect();
+        if let Some(days) = remove_idle {
+            targets.retain(|t| !remove_if_idle(t, days, cfg.dry_run));
+        }
+        profiles.extend(targets.iter().flat_map(|t| profile_dirs(t)));
+        if profiles.is_empty() {
+            println!("no Cargo target dirs found");
+        }
+    } else if dirs.is_empty() {
+        profiles = resolve_profiles(None);
+    } else {
+        for d in dirs {
+            profiles.extend(resolve_profiles(Some(d)));
+        }
+    }
     let mut total = 0;
     for p in profiles {
         match prune(&p, &cfg) {

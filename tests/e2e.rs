@@ -726,6 +726,75 @@ fn background_failure_leaves_a_notice() {
     }
 }
 
+#[test]
+fn server_mode_recursive_and_remove_idle() {
+    let a = Ws::new("srv-a");
+    let b = Ws::new("srv-b");
+    for ws in [&a, &b] {
+        ws.deps(A10);
+        ws.run_all(&CMDS[..1]);
+        ws.deps(A11);
+        ws.run_all(&CMDS[..1]);
+    }
+    age_tree(&b.target, 40 * 24 * 3600); // nothing compiled into b for 40 days
+    let run = |extra: &[&str]| {
+        let out = Command::new(BIN)
+            .args(["autoprune", "-r", "--remove-idle", "30", "--grace", "0"])
+            .args(extra)
+            .arg(&a.root)
+            .arg(&b.root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let dry = run(&["--dry-run"]);
+    assert!(
+        dry.contains("would remove the whole dir") && b.target.exists(),
+        "{dry}"
+    );
+    let real = run(&[]);
+    assert!(!b.target.exists(), "idle target should be gone: {real}");
+    assert!(a.target.exists());
+    assert!(
+        real.contains("superseded"),
+        "the active target is pruned as usual: {real}"
+    );
+    assert_eq!(a.cargo(CMDS[0]), 0);
+}
+
+#[test]
+fn ci_mode_drops_incremental_and_keeps_the_build() {
+    let ws = Ws::new("ci");
+    ws.deps(A10);
+    ws.run_all(&CMDS[..2]);
+    ws.deps(A11);
+    ws.run_all(&CMDS[..2]);
+    let out = Command::new(BIN)
+        .args(["autoprune", "--ci"])
+        .arg(&ws.dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let inc = fs::read_dir(ws.target.join("debug/incremental"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(inc, 0, "incremental dirs left");
+    assert_eq!(
+        ws.run_all(&CMDS[..2]),
+        0,
+        "dropping incremental must not force a rebuild"
+    );
+}
+
 fn dir_size(p: &std::path::Path) -> u64 {
     let Ok(m) = fs::symlink_metadata(p) else {
         return 0;

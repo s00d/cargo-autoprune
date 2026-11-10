@@ -1,0 +1,38 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+        env:
+          RUST_BACKTRACE: "1"
+  action:
+    # the composite action on a real target: build, change the version (every unit rehashes),
+    # build again, prune, and check that the next build compiles nothing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --all-targets
+      - run: sed -i 's/^version = "0.1.0"/version = "0.1.1"/' Cargo.toml && cargo build --all-targets
+      - run: du -sh target
+      - uses: ./
+        with:
+          args: --verbose
+      - run: du -sh target
+      - name: nothing rebuilds after the prune
+        run: |
+          cargo build --all-targets 2>&1 | tee build.log
+          ! grep -q Compiling build.log

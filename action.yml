@@ -1,0 +1,41 @@
+name: cargo-autoprune
+description: Trim Cargo target dirs before a CI cache is saved (superseded units, unreachable dependencies, incremental state)
+branding:
+  icon: scissors
+  color: orange
+inputs:
+  path:
+    description: Target, project or parent dir
+    default: "."
+  recursive:
+    description: Find every Cargo target dir under path
+    default: "false"
+  max-size:
+    description: Cap per profile dir, e.g. 2G (empty = no cap)
+    default: ""
+  args:
+    description: Extra cargo-autoprune arguments, e.g. --verbose
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        AP_PATH: ${{ inputs.path }}
+        AP_RECURSIVE: ${{ inputs.recursive }}
+        AP_MAX_SIZE: ${{ inputs.max-size }}
+        AP_ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+        if ! command -v cargo-autoprune >/dev/null; then
+          # a job-level CARGO_TARGET_DIR must not receive the tool's own build
+          env -u CARGO_TARGET_DIR cargo install --locked --quiet --path "$GITHUB_ACTION_PATH" --root "$RUNNER_TEMP/cargo-autoprune"
+          echo "$RUNNER_TEMP/cargo-autoprune/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/cargo-autoprune/bin:$PATH"
+        fi
+        args=(autoprune --ci)
+        if [ "$AP_RECURSIVE" = true ]; then args+=(-r); fi
+        if [ -n "$AP_MAX_SIZE" ]; then args+=(--max-size "$AP_MAX_SIZE"); fi
+        # shellcheck disable=SC2206
+        extra=($AP_ARGS)
+        cargo-autoprune "${args[@]}" "${extra[@]}" "$AP_PATH"

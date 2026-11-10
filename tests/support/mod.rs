@@ -74,7 +74,7 @@ impl Ws {
         ws.write(
             ".cargo/config.toml",
             &format!(
-                "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"{}\"\n",
+                "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = '{}'\n",
                 v.display()
             ),
         );
@@ -344,8 +344,37 @@ pub fn age_tree(p: &Path, secs: u64) {
             age_tree(&e.unwrap().path(), secs);
         }
     }
-    if let (Ok(t), Ok(f)) = (m.modified(), fs::File::open(p)) {
+    if let (Ok(t), Ok(f)) = (m.modified(), open_for_times(p)) {
         let _ = f.set_modified(t - Duration::from_secs(secs));
+    }
+}
+
+#[cfg(windows)]
+fn open_for_times(p: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS lets a directory be opened; FILE_WRITE_ATTRIBUTES for the times
+    fs::OpenOptions::new()
+        .access_mode(0x100)
+        .custom_flags(0x0200_0000)
+        .open(p)
+}
+#[cfg(not(windows))]
+fn open_for_times(p: &Path) -> std::io::Result<fs::File> {
+    fs::File::open(p)
+}
+
+/// A path as a TOML literal string (Windows backslashes are not escapes there).
+pub fn toml_path(p: &Path) -> String {
+    format!("'{}'", p.display())
+}
+
+/// A local repo path as a `file://` URL on every platform.
+pub fn file_url(p: &Path) -> String {
+    let s = p.display().to_string().replace('\\', "/");
+    if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
     }
 }
 

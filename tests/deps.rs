@@ -90,7 +90,7 @@ fn path_dependency_outside_the_workspace() {
     };
     fs::write(ext.join("src/lib.rs"), "pub fn e() -> u32 { dep_a::a() }\n").unwrap();
     manifest("1.0.0");
-    let dep = format!("ext = {{ path = \"{}\" }}", ext.display());
+    let dep = format!("ext = {{ path = {} }}", toml_path(&ext));
     step(&ws, &dep);
     manifest("1.1.0"); // the outside crate's own dependency changes
     step(&ws, &dep);
@@ -111,8 +111,8 @@ fn patched_registry_crate() {
     let workspace = |patch: bool| {
         let p = if patch {
             format!(
-                "[patch.crates-io]\ndep_a = {{ path = \"{}\" }}\n",
-                patched.display()
+                "[patch.crates-io]\ndep_a = {{ path = {} }}\n",
+                toml_path(&patched)
             )
         } else {
             String::new()
@@ -189,8 +189,8 @@ fn git_dependency() {
     let env = [("CARGO_HOME", home_s.as_str())];
     let run = |rev: &str| {
         ws.deps(&format!(
-            "dep_g = {{ git = \"file://{}\", rev = \"{rev}\" }}",
-            repo.display()
+            "dep_g = {{ git = \"{}\", rev = \"{rev}\" }}",
+            file_url(&repo)
         ));
         let fetch = Command::new("cargo")
             .current_dir(&ws.dir)

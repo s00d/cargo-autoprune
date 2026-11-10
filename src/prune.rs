@@ -1,7 +1,8 @@
 //! One prune pass over a profile dir: lock, scan, plan, delete, record.
 
 use crate::fingerprint::{recorded_units, sibling_dep_values, workspace};
-use crate::fsutil::{par_map, size_of};
+use crate::fsutil::{entries, mtime, par_map, size_of};
+use crate::layout::split_hash;
 use crate::layout::{is_profile_dir, STATE_DIR, TAGS_DIR, UNITS_FILE};
 use crate::lock::{acquire_cargo_locks, lock_file};
 use crate::plan::{apply_cap, plan};
@@ -22,6 +23,10 @@ pub struct Config {
     pub dry_run: bool,
     /// How long to wait for a running cargo to release the build lock.
     pub lock_wait: Duration,
+    /// How long one delete batch may hold Cargo's locks before letting a waiting cargo in.
+    pub lock_batch: Duration,
+    /// Delete every incremental dir (CI: incremental state is never reused there).
+    pub drop_incremental: bool,
 }
 
 impl Config {
@@ -79,6 +84,8 @@ impl Default for Config {
             max_size: None,
             dry_run: false,
             lock_wait: Duration::from_secs(3600),
+            lock_batch: Duration::from_millis(1000),
+            drop_incremental: false,
         }
     }
 }
@@ -97,7 +104,7 @@ pub struct Report {
     pub pinned_now: Vec<String>,
     pub removed: Vec<PathBuf>,
     pub elapsed: Duration,
-    /// Part of `elapsed` spent holding Cargo's locks (a cargo started meanwhile waits this long).
+    /// Longest single hold of Cargo's locks: the most a cargo started meanwhile waits.
     pub locked: Duration,
 }
 
@@ -182,21 +189,60 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     ph.mark("size cap");
 
     // Under Cargo's locks: unlink doomed files, move doomed directories into the trash (one rename
-    // each). The directories' contents are deleted after the locks are released.
+    // each; their contents are deleted after unlocking). A big cleanup goes in batches of about
+    // `Config::lock_batch` (1 s): between batches the locks are released so a waiting cargo gets in, and every
+    // unit is re-validated before it is touched again.
     let mut moved = Vec::new();
     let mut freed = 0u64;
     let mut new_deleted = Vec::new();
     if !cfg.dry_run && !doomed.is_empty() {
         fs::create_dir_all(&trash)?;
     }
-    let mut files = Vec::new();
+    let mut locks = Some(cargo_locks);
+    let mut hold = Instant::now();
+    let mut longest = Duration::ZERO;
+    let mut fp_hashes: Option<HashSet<String>> = None; // set after a relock
+    let mut files: Vec<PathBuf> = Vec::new();
+    let flush = |files: &mut Vec<PathBuf>, errors: &mut Vec<String>| {
+        errors.extend(
+            par_map(std::mem::take(files), |p| remove_path(&p))
+                .into_iter()
+                .flatten(),
+        );
+    };
     for c in &doomed {
+        if !cfg.dry_run && hold.elapsed() >= cfg.lock_batch {
+            flush(&mut files, &mut report.errors);
+            longest = longest.max(hold.elapsed());
+            drop(locks.take());
+            std::thread::sleep(Duration::from_millis(20)); // a waiting cargo takes the lock now
+            match acquire_cargo_locks(profile, cfg.lock_wait)? {
+                Some(l) => locks = Some(l),
+                None => break, // the rest waits for the next prune
+            }
+            hold = Instant::now();
+            let names = entries(&profile.join(".fingerprint"));
+            fp_hashes = Some(
+                names
+                    .iter()
+                    .filter_map(|e| split_hash(&e.name).map(|(_, h, _)| h.to_owned()))
+                    .collect(),
+            );
+        }
+        if let Some(fps) = &fp_hashes {
+            let unchanged = match &c.guard {
+                Some(g) => mtime(g) == c.mtime,
+                None => c.incremental || !fps.contains(&c.id),
+            };
+            if !unchanged {
+                continue; // cargo rebuilt or touched it while the lock was free
+            }
+        }
         for p in &c.paths {
             if cfg.dry_run {
                 freed += size_of(p);
             } else {
                 match fs::symlink_metadata(p) {
-                    // a directory goes with one rename; its files are deleted after unlocking
                     Ok(m) if m.is_dir() => {
                         let dst = trash.join(moved.len().to_string());
                         match fs::rename(p, &dst) {
@@ -204,15 +250,17 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
                             Err(_) => report.errors.extend(remove_path(p)),
                         }
                     }
-                    // a plain file: unlink touches one directory, a rename would touch two
                     Ok(m) => {
                         freed += m.len();
-                        files.push(p.clone());
+                        files.push(p.clone()); // unlink touches one directory, rename two
                     }
                     Err(_) => {}
                 }
             }
             report.removed.push(p.clone());
+        }
+        if files.len() >= 1000 {
+            flush(&mut files, &mut report.errors); // so the batch clock sees the unlinks
         }
         *report.by_reason.entry(c.reason).or_default() += 1;
         if c.incremental {
@@ -222,30 +270,31 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
         }
         new_deleted.push(c.id.clone());
     }
-    report
-        .errors
-        .extend(par_map(files, |p| remove_path(&p)).into_iter().flatten());
+    flush(&mut files, &mut report.errors);
     ph.mark("delete (locked)");
     if !cfg.dry_run {
         let mut deleted = deleted_before;
         let ts = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        deleted.extend(new_deleted.into_iter().map(|id| (id, ts)));
+        deleted.extend(new_deleted.iter().map(|id| (id.clone(), ts)));
         write_deleted(&state.join("deleted"), &deleted)?;
         clean_tags(&state.join(TAGS_DIR), profile);
         write_pins(&state.join("pinned"), &pinned)?;
         write_pins(&state.join("suspects"), &suspects)?;
-        // keep unit records only for units still there (no rustc runs while we hold the locks)
-        let gone: HashSet<&str> = doomed.iter().map(|c| c.id.as_str()).collect();
+        let gone: HashSet<&str> = new_deleted.iter().map(String::as_str).collect();
         let records: String = recorded_units(profile)
             .into_iter()
             .filter(|(h, _)| !gone.contains(h.as_str()) && homes.contains_key(h))
             .map(|(h, d)| format!("{h}\t{}\n", d.display()))
             .collect();
-        let _ = crate::fsutil::atomic_write(&state.join(UNITS_FILE), &records);
+        if locks.is_some() {
+            // only while no rustc can append to it
+            let _ = crate::fsutil::atomic_write(&state.join(UNITS_FILE), &records);
+        }
         ph.mark("write state");
     }
-    drop(cargo_locks);
-    report.locked = start.elapsed();
+    longest = longest.max(hold.elapsed());
+    drop(locks);
+    report.locked = longest;
     report.freed_bytes = freed + moved.iter().map(|p| size_of(p)).sum::<u64>();
     if !cfg.dry_run {
         report.errors.extend(remove_path(&trash));
@@ -510,6 +559,28 @@ mod tests {
         assert_eq!(r.removed_units, 1);
         assert!(!fx.exists(&format!("deps/liba-{A}.rlib")));
         assert!(fx.exists(&format!("deps/libb-{B}.rlib")));
+    }
+
+    #[test]
+    fn batched_delete_relocks_and_finishes() {
+        // a zero batch releases and retakes the locks before every unit
+        let fx = Fx::new("batch");
+        for (i, h) in [A, B].iter().enumerate() {
+            fx.lib(&format!("old{i}"), h, 7200, false);
+        }
+        fx.lib("old0", C, 10, false);
+        fx.lib("old1", "dddddddddddddddd", 10, false);
+        fx.file("deps/orphan-eeeeeeeeeeeeeeee.d", 10);
+        let r = fx.run(&Config {
+            lock_batch: Duration::ZERO,
+            ..cfg()
+        });
+        assert_eq!(r.removed_units, 3);
+        assert!(
+            !fx.exists(&format!("deps/libold0-{A}.rlib"))
+                && !fx.exists(&format!("deps/libold1-{B}.rlib"))
+        );
+        assert!(fx.exists(&format!("deps/libold0-{C}.rlib")));
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub mod cli;
 mod fingerprint;
 mod fsutil;
 pub mod layout;
-mod lock;
+pub(crate) mod lock;
 mod plan;
 pub mod prune;
 mod scan;

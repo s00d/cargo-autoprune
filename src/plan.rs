@@ -40,6 +40,10 @@ pub(crate) struct Candidate {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) mtime: Option<SystemTime>,
     pub(crate) incremental: bool,
+    /// File whose mtime was `mtime` at scan time (fingerprint stamp, incremental dir). When the
+    /// lock was released between delete batches, a changed guard means cargo touched the unit:
+    /// it is skipped. `None`: an orphan, valid while no fingerprint for its hash appears.
+    pub(crate) guard: Option<PathBuf>,
 }
 
 pub(crate) fn plan(
@@ -98,6 +102,7 @@ pub(crate) fn plan(
             mtime: u.mtime,
             incremental: false,
             reason: "",
+            guard: u.guard.clone(),
         };
         if !u.has_fingerprint {
             doomed.push(Candidate {
@@ -278,7 +283,10 @@ pub(crate) fn plan(
             }
         }
     }
-    let keep_dir: Vec<bool> = keep_dir.into_iter().map(|k| k.unwrap_or(false)).collect();
+    let keep_dir: Vec<bool> = keep_dir
+        .into_iter()
+        .map(|k| k.unwrap_or(false) && !cfg.drop_incremental)
+        .collect();
     let mut inc_doomed = Vec::new();
     let mut inc_kept = Vec::new();
     for ((dir, path, t, _), keep) in incremental.into_iter().zip(keep_dir) {
@@ -287,6 +295,7 @@ pub(crate) fn plan(
             value: None,
             inodes: Vec::new(),
             id: format!("inc:{dir}"),
+            guard: Some(path.clone()),
             paths: vec![path],
             mtime: t,
             incremental: true,

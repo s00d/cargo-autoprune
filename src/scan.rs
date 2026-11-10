@@ -27,6 +27,7 @@ pub(crate) struct Unit {
     pub(crate) inodes: Vec<u64>, // of `.rmeta` / `.rcgu.o` files, shared with incremental sessions
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) mtime: Option<SystemTime>,
+    pub(crate) guard: Option<PathBuf>, // the file `mtime` was read from (fingerprinted units)
 }
 
 impl Unit {
@@ -94,7 +95,9 @@ pub(crate) fn scan(
         u.tag = tags.get(h).cloned().unwrap_or_default();
         // cargo writes invoked.timestamp every time it builds the unit
         let stamp = files.iter().find(|f| f.name == "invoked.timestamp");
-        u.mtime = mtime(stamp.map_or(&e.path, |f| &f.path));
+        let guard = stamp.map_or(&e.path, |f| &f.path).clone();
+        u.mtime = mtime(&guard);
+        u.guard = Some(guard);
         let h = h.to_owned();
         u.paths.push(e.path);
         Some((h, u))

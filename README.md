@@ -61,6 +61,41 @@ The next build prints those once on the terminal (`/dev/tty`), as
 They don't go to stderr because cargo stores a crate's stderr and replays it on every later build
 of that crate. Without a terminal (IDE, CI) the notices stay for `cargo autoprune status`.
 
+## CI and servers
+
+**GitHub Actions.** A restored `target/` cache keeps every superseded copy from earlier commits,
+so it grows with each run. Trim it right before the cache is saved (the cache's post step runs
+after your steps):
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.cargo/registry
+      target
+    key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+    restore-keys: cargo-${{ runner.os }}-
+- run: cargo test
+- uses: s00d/cargo-autoprune@main   # = cargo autoprune --ci .
+  with:
+    max-size: 4G                    # optional
+```
+
+`--ci` means grace 0 (a job's own build is the only live state) and drops incremental dirs, which
+CI never reuses. Don't put the wrapper into CI: a background prune could still be running when the
+job ends. Run the step instead.
+
+**Servers and self-hosted runners.** One command walks a tree of projects (or a runner's `_work`
+dir), prunes every Cargo target dir it finds and deletes whole target dirs nothing was compiled
+into for N days:
+
+```bash
+cargo autoprune -r --remove-idle 30 ~/projects ~/actions-runner/_work
+```
+
+Run it from cron or a systemd timer, e.g. `0 4 * * * cargo-autoprune autoprune -r --remove-idle 30 /srv/build`.
+Target dirs locked by a running cargo are skipped. `--dry-run` shows what would happen.
+
 ## How it works
 
 1. **Wrapper (hot path).** Cargo runs `cargo-autoprune rustc <args>` for every crate it compiles.

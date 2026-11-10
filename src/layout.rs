@@ -59,6 +59,26 @@ pub fn is_profile_dir(p: &Path) -> bool {
             .any(|a| a.join("CACHEDIR.TAG").is_file())
 }
 
+/// Cargo target dirs under `root` (dirs with `CACHEDIR.TAG` that hold profile dirs). Does not
+/// descend into a found target dir, hidden dirs or `node_modules`, and never follows symlinks.
+pub fn find_target_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if d.join("CACHEDIR.TAG").is_file() && !profile_dirs(&d).is_empty() {
+            out.push(d);
+            continue;
+        }
+        for e in crate::fsutil::entries(&d) {
+            if e.is_dir && !e.name.starts_with('.') && e.name != "node_modules" {
+                stack.push(e.path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Profile dirs inside a target dir (`debug`, `release`, `<triple>/debug`, custom profiles).
 pub fn profile_dirs(target: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

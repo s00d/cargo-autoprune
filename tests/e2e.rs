@@ -879,15 +879,12 @@ fn revert_reuses_old_copies_and_the_dead_newer_ones_go() {
     ws.deps(&format!("{A10}\ndep_b = \"1\""));
     ws.run_all(&CMDS[..2]); // the revert reuses the old copies (Windows relinks a binary anyway)
     ws.run_all(&CMDS[..2]);
-    // an hour later: every copy is far older than the grace period (sources age too, or cargo
-    // would see them newer than their outputs and rebuild for that reason)
-    age_tree(&ws.root, 3600);
-    // ages also the lock file: put it back to "now" so it stays the newest change
-    let lock = ws.dir.join("Cargo.lock");
-    fs::write(&lock, fs::read(&lock).unwrap()).unwrap();
-    let steady = ws.run_all(&CMDS[..2]);
-    assert_eq!(steady, 0, "aging alone made cargo rebuild");
-    let reports = ws.prune_with(cfg());
+    // "after the grace period" without faking time: a zero grace makes every older copy a
+    // candidate, exactly the situation in which newest-wins alone deleted the live copies
+    let reports = ws.prune_with(Config {
+        grace: Duration::ZERO,
+        ..cfg()
+    });
     let rebuilt = ws.run_all(&CMDS[..2]);
     if rebuilt != 0 {
         for r in &reports {

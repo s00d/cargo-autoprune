@@ -101,6 +101,9 @@ pub(crate) fn plan(
     }
 
     type Member = (Candidate, Vec<u64>, Option<PathBuf>);
+    let lock_changed = ws.and_then(|w| w.lock_changed);
+    let before_lock =
+        |t: SystemTime, newest: SystemTime| lock_changed.is_some_and(|l| t < l && newest >= l);
     let mut groups: HashMap<String, Vec<Member>> = HashMap::new();
     let mut registry: Vec<(Candidate, Option<u64>, Vec<u64>)> = Vec::new();
     for (h, u) in units {
@@ -162,7 +165,9 @@ pub(crate) fn plan(
             _ => false,
         };
         for (c, deps, dep_info) in members {
-            let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n);
+            // older than the newest by more than the grace period, or built before the last
+            // Cargo.lock change while the newest was built after it (a dependency change)
+            let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n || before_lock(t, n));
             if (stale || dead_variant) && !pinned.contains_key(&key) {
                 let reason = if stale { "superseded" } else { "stale variant" };
                 doomed.push(Candidate { reason, ..c });
@@ -211,7 +216,7 @@ pub(crate) fn plan(
         }
         for ((c, _, _), live) in registry.into_iter().zip(live) {
             // defense in depth: a unit written within the grace period is never "unreachable"
-            let recent = matches!((newest_all, c.mtime), (Some(n), Some(t)) if t + cfg.grace >= n);
+            let recent = matches!((newest_all, c.mtime), (Some(n), Some(t)) if t + cfg.grace >= n && !before_lock(t, n));
             if live || recent {
                 kept.push(c)
             } else {

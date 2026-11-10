@@ -832,6 +832,31 @@ fn background_prune_waits_until_cargo_test_has_run_the_tests() {
     );
 }
 
+#[test]
+fn lockfile_change_supersedes_without_waiting_for_grace() {
+    // with the default 10 min grace: a Cargo.lock change makes the old copies dead right away
+    let ws = Ws::new("lockgrace");
+    let cfg = || Config {
+        lock_wait: Duration::from_secs(60),
+        ..Config::default()
+    };
+    ws.deps(A10);
+    ws.run_all(&CMDS[..2]);
+    std::thread::sleep(Duration::from_millis(1100)); // the lock file's mtime must be newer
+    ws.deps(A11);
+    ws.run_all(&CMDS[..2]);
+    ws.prune_with(cfg());
+    let rlibs: Vec<_> = ws
+        .deps_files("debug", "libdep_a-")
+        .into_iter()
+        .filter(|f| f.ends_with(".rlib"))
+        .collect();
+    assert_eq!(rlibs.len(), 1, "{rlibs:?}");
+    let (left, lost) = ws.oracle_diff(&CMDS[..2]);
+    assert!(lost.is_empty(), "{lost:#?}");
+    assert!(left.is_empty(), "{left:#?}");
+}
+
 fn host_triple() -> String {
     let out = Command::new("rustc").arg("-vV").output().unwrap();
     String::from_utf8_lossy(&out.stdout)

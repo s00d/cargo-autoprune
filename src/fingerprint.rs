@@ -11,6 +11,8 @@ pub(crate) struct Workspace {
     /// Dirs holding a workspace `Cargo.lock` (several when a target dir is shared).
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) locals: HashSet<String>,
+    /// When a `Cargo.lock` last changed (cargo rewrites it only when its content changes).
+    pub(crate) lock_changed: Option<std::time::SystemTime>,
 }
 
 impl Workspace {
@@ -118,7 +120,19 @@ pub(crate) fn workspace(profile: &Path) -> (Option<Workspace>, HashMap<String, P
             &fs::read_to_string(r.join("Cargo.lock")).unwrap_or_default(),
         ));
     }
-    let ws = (!locals.is_empty()).then_some(Workspace { roots, locals });
+    let lock_changed = roots
+        .iter()
+        .filter_map(|r| {
+            fs::metadata(r.join("Cargo.lock"))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .max();
+    let ws = (!locals.is_empty()).then_some(Workspace {
+        roots,
+        locals,
+        lock_changed,
+    });
     (ws, homes)
 }
 

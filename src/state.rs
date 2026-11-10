@@ -87,13 +87,100 @@ pub(crate) fn log(p: &Path, r: &Report) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
         let _ = writeln!(
             f,
-            "{ts} units={} incremental={} freed={} pinned={} took={}ms locked={}ms",
+            "{ts} units={} incremental={} freed={} pinned={} took={}ms locked={}ms errors={} [{}]",
             r.removed_units,
             r.removed_incremental,
             human(r.freed_bytes),
             r.pinned_now.len(),
             r.elapsed.as_millis(),
-            r.locked.as_millis()
+            r.locked.as_millis(),
+            r.errors.len(),
+            r.breakdown()
         );
+    }
+}
+
+/// One-line messages for the user, written by the background prune and printed once by the
+/// wrapper on the terminal (`/dev/tty`): cargo would cache and replay anything on stderr.
+pub(crate) const NOTICE_FILE: &str = "notice";
+const MAX_NOTICE_BYTES: u64 = 4096;
+
+pub(crate) fn add_notice(state: &Path, msg: &str) {
+    let p = state.join(NOTICE_FILE);
+    if fs::metadata(&p).is_ok_and(|m| m.len() > MAX_NOTICE_BYTES) {
+        return; // nobody reads them (no terminal): don't grow
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+pub(crate) fn read_notices(state: &Path) -> Vec<String> {
+    fs::read_to_string(state.join(NOTICE_FILE))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Notices worth telling the user about a background prune.
+pub(crate) fn notices_for(profile: &Path, r: &Report) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(e) = r.errors.first() {
+        out.push(format!(
+            "could not delete {} path(s) in {}, e.g. {e}",
+            r.errors.len(),
+            profile.display()
+        ));
+    }
+    if r.freed_bytes >= 1 << 30 {
+        out.push(format!(
+            "freed {} in {} ({})",
+            human(r.freed_bytes),
+            profile.display(),
+            r.breakdown()
+        ));
+    }
+    if r.locked.as_secs() >= 5 {
+        out.push(format!(
+            "pruning {} held cargo's build lock for {} s (a first cleanup of a large target)",
+            profile.display(),
+            r.locked.as_secs()
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn notices_for_big_frees_errors_and_long_locks() {
+        let p = Path::new("/t/debug");
+        let mut r = Report::default();
+        assert!(notices_for(p, &r).is_empty(), "a normal prune is silent");
+        r.freed_bytes = 3 << 30;
+        r.by_reason.insert("superseded", 7);
+        r.errors.push("/t/debug/deps/x: Permission denied".into());
+        r.locked = Duration::from_secs(9);
+        let n = notices_for(p, &r);
+        assert_eq!(n.len(), 3, "{n:?}");
+        assert!(n[0].contains("could not delete 1 path(s)"));
+        assert!(n[1].contains("freed 3.0GiB") && n[1].contains("superseded 7"));
+        assert!(n[2].contains("9 s"));
+    }
+
+    #[test]
+    fn notice_file_is_capped() {
+        let d = std::env::temp_dir().join(format!("autoprune-notice-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        for i in 0..1000 {
+            add_notice(&d, &format!("message number {i}"));
+        }
+        assert!(fs::metadata(d.join(NOTICE_FILE)).unwrap().len() < 2 * MAX_NOTICE_BYTES);
+        assert_eq!(read_notices(&d)[0], "message number 0");
+        let _ = fs::remove_dir_all(&d);
     }
 }

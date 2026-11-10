@@ -355,7 +355,13 @@ fn cli_dry_run_and_prune() {
     let dry = run(&["autoprune", "--dry-run"]);
     assert!(dry.contains("would remove"), "{dry}");
     assert_eq!(before, inventory(&ws.target), "dry run changed files");
+    let st = run(&["autoprune", "status"]);
+    assert!(
+        st.contains("reclaimable now") && st.contains("superseded"),
+        "{st}"
+    );
     let real = run(&["autoprune"]);
+    assert!(real.contains("superseded"), "breakdown missing: {real}");
     assert!(real.contains("removed"), "{real}");
     assert_eq!(
         ws.deps_files("debug", "libdep_a-")
@@ -624,6 +630,68 @@ fn host_triple() -> String {
         .find_map(|l| l.strip_prefix("host: "))
         .unwrap()
         .to_owned()
+}
+
+#[test]
+fn cli_accepts_a_directory_without_subcommand() {
+    // `cargo-autoprune DIR` must not be taken for a wrapper call (cargo passes rustc first)
+    let ws = Ws::new("cli-dir");
+    ws.deps(A10);
+    ws.run_all(&CMDS[..1]);
+    let out = Command::new(BIN)
+        .arg(&ws.dir)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("would remove"));
+    let out = Command::new(BIN)
+        .args(["status"])
+        .arg(&ws.dir)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("units"));
+}
+
+#[test]
+fn background_failure_leaves_a_notice() {
+    let ws = Ws::new("notice");
+    ws.deps(A10);
+    ws.run_all(&CMDS[..1]);
+    // a profile dir the background pruner refuses (no CACHEDIR.TAG above it)
+    let bogus = ws.root.join("bogus/debug");
+    fs::create_dir_all(&bogus).unwrap();
+    fs::write(bogus.join(".cargo-lock"), "").unwrap();
+    let out = Command::new(BIN)
+        .arg("--background")
+        .arg(&bogus)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // nothing to report there (no state dir can be trusted), but a real profile reports errors:
+    let debug = ws.target.join("debug");
+    let deps = debug.join("deps");
+    ws.deps(A11);
+    ws.run_all(&CMDS[..1]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&deps, fs::Permissions::from_mode(0o555)).unwrap(); // unlink fails
+        let out = Command::new(BIN)
+            .arg("--background")
+            .arg(&debug)
+            .env("CARGO_AUTOPRUNE_GRACE", "0")
+            .output()
+            .unwrap();
+        fs::set_permissions(&deps, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(out.status.success());
+        let notice = fs::read_to_string(debug.join(".autoprune/notice")).unwrap_or_default();
+        assert!(notice.contains("could not delete"), "{notice:?}");
+    }
 }
 
 fn dir_size(p: &std::path::Path) -> u64 {

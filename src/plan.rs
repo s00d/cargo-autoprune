@@ -28,6 +28,9 @@ use std::time::{Duration, SystemTime};
 const RUSTC_RETIRE: Duration = Duration::from_secs(14 * 24 * 3600);
 
 pub(crate) struct Candidate {
+    /// Why it is deleted (report breakdown): orphan, superseded, unreachable, removed target,
+    /// old toolchain, size cap. Empty while kept.
+    pub(crate) reason: &'static str,
     pub(crate) krate: Option<String>,
     pub(crate) value: Option<u64>,
     pub(crate) id: String, // what goes into the `deleted` log: hash or `inc:<dir>`
@@ -92,9 +95,18 @@ pub(crate) fn plan(
             paths: u.paths.clone(),
             mtime: u.mtime,
             incremental: false,
+            reason: "",
         };
-        if !u.has_fingerprint || retired(&u) {
-            doomed.push(c); // no fingerprint: cargo rebuilds it anyway
+        if !u.has_fingerprint {
+            doomed.push(Candidate {
+                reason: "orphan",
+                ..c
+            }); // cargo rebuilds it anyway
+        } else if retired(&u) {
+            doomed.push(Candidate {
+                reason: "old toolchain",
+                ..c
+            });
         } else if local {
             let is_run = u.fp_kind.iter().any(|k| k.starts_with("run-build-script"));
             groups
@@ -114,7 +126,10 @@ pub(crate) fn plan(
         for (c, deps, is_run, dep_info) in members {
             let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n);
             if stale && !pinned.contains_key(&key) {
-                doomed.push(c);
+                doomed.push(Candidate {
+                    reason: "superseded",
+                    ..c
+                });
             } else {
                 kept_local.push((c, deps, is_run, dep_info));
             }
@@ -129,7 +144,10 @@ pub(crate) fn plan(
     let mut kept_local = Vec::new();
     for (c, deps, is_run, gone) in checked {
         if gone {
-            doomed.push(c);
+            doomed.push(Candidate {
+                reason: "removed target",
+                ..c
+            });
         } else {
             kept_local.push((c, deps, is_run));
         }
@@ -142,7 +160,10 @@ pub(crate) fn plan(
             && deps.iter().any(|v| doomed_vals.contains(v))
             && !deps.iter().any(|v| kept_vals.contains(v));
         if orphan_run {
-            doomed.push(c);
+            doomed.push(Candidate {
+                reason: "removed target",
+                ..c
+            });
         } else {
             roots.extend(deps);
             kept.push(c);
@@ -169,7 +190,10 @@ pub(crate) fn plan(
             if live {
                 kept.push(c)
             } else {
-                doomed.push(c)
+                doomed.push(Candidate {
+                    reason: "unreachable",
+                    ..c
+                })
             }
         }
     }
@@ -244,6 +268,7 @@ pub(crate) fn plan(
             paths: vec![path],
             mtime: t,
             incremental: true,
+            reason: "stale incremental",
         };
         if keep {
             inc_kept.push(c)
@@ -270,7 +295,10 @@ pub(crate) fn apply_cap(
             break;
         }
         total -= c.paths.iter().map(|p| size_of(p)).sum::<u64>().min(total);
-        doomed.push(c);
+        doomed.push(Candidate {
+            reason: "size cap",
+            ..c
+        });
     }
     doomed
 }

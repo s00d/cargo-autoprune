@@ -6,6 +6,7 @@ fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.first().and_then(|a| a.to_str()) {
         Some("autoprune") => cli::run(&args[1..]), // `cargo autoprune ...`
+        Some("status") => cli::run(&args),
         Some("--background") => wrapper::background(args.get(1).map(PathBuf::from)),
         None => cli::run(&[]),
         // `cargo-autoprune DIR ...`: cargo always passes a rustc path first, never a directory

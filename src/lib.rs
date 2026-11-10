@@ -13,7 +13,7 @@ mod lock;
 mod plan;
 pub mod prune;
 mod scan;
-mod state;
+pub(crate) mod state;
 pub mod wrapper;
 
 #[cfg(test)]

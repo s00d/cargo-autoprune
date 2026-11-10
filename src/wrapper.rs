@@ -1,7 +1,8 @@
 //! The `rustc-wrapper` hot path: tag clippy units, maybe spawn a background prune, exec rustc.
 
 use crate::layout::{has_cargo_lock, STATE_DIR, TAGS_DIR, UNITS_FILE};
-use crate::prune::{env_secs, prune, Config};
+use crate::prune::{env_secs, prune, Config, Outcome};
+use crate::state::{add_notice, notices_for, read_notices, NOTICE_FILE};
 use std::env;
 use std::ffi::OsString;
 use std::fs::File;
@@ -160,6 +161,7 @@ fn maybe_trigger(profile: &Path) {
     if fresh {
         return;
     }
+    show_notices(profile);
     let _ = std::fs::create_dir_all(stamp.parent().unwrap_or(profile));
     if File::create(&stamp).is_err() {
         return;
@@ -186,7 +188,35 @@ fn maybe_trigger(profile: &Path) {
 
 pub fn background(profile: Option<PathBuf>) {
     let Some(profile) = profile else { return };
-    let _ = prune(&profile, &Config::from_env());
+    let state = profile.join(STATE_DIR);
+    let notices = match prune(&profile, &Config::from_env()) {
+        Ok(Outcome::Done(r)) => notices_for(&profile, &r),
+        Ok(Outcome::Busy) => Vec::new(), // another prune runs, or cargo kept the lock for an hour
+        Err(e) => vec![format!(
+            "background prune of {} failed: {e}",
+            profile.display()
+        )],
+    };
+    for n in notices {
+        add_notice(&state, &n);
+    }
+}
+
+/// Print pending notices once on the terminal. Not on stderr: cargo stores a crate's stderr and
+/// replays it on every later build until the crate is recompiled.
+fn show_notices(profile: &Path) {
+    let file = profile.join(STATE_DIR).join(NOTICE_FILE);
+    if !file.exists() || env::var_os("CARGO_AUTOPRUNE_QUIET").is_some() {
+        return;
+    }
+    let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") else {
+        return; // no terminal (IDE, CI): keep them for `cargo autoprune status`
+    };
+    use std::io::Write;
+    for n in read_notices(&profile.join(STATE_DIR)) {
+        let _ = writeln!(tty, "\x1b[1;33mwarning\x1b[0m: cargo-autoprune: {n}");
+    }
+    let _ = std::fs::remove_file(file);
 }
 
 #[cfg(test)]

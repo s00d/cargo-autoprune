@@ -58,15 +58,13 @@ impl Phases {
     }
 }
 
-fn remove_path(p: &Path) {
+fn remove_path(p: &Path) -> Option<String> {
     let r = match fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => fs::remove_dir_all(p),
         Ok(_) => fs::remove_file(p),
-        Err(_) => return,
+        Err(_) => return None,
     };
-    if let Err(e) = r {
-        eprintln!("cargo-autoprune: {}: {e}", p.display());
-    }
+    r.err().map(|e| format!("{}: {e}", p.display()))
 }
 
 pub(crate) fn env_secs(name: &str, default: u64) -> Duration {
@@ -87,6 +85,10 @@ impl Default for Config {
 
 #[derive(Debug, Default)]
 pub struct Report {
+    /// Removed units and incremental dirs per reason (orphan, superseded, unreachable, ...).
+    pub by_reason: std::collections::BTreeMap<&'static str, usize>,
+    /// Paths that could not be deleted (first few errors).
+    pub errors: Vec<String>,
     /// Wall time of each phase, for `--verbose` / `CARGO_AUTOPRUNE_TRACE`.
     pub phases: Vec<(&'static str, Duration)>,
     pub removed_units: usize,
@@ -97,6 +99,18 @@ pub struct Report {
     pub elapsed: Duration,
     /// Part of `elapsed` spent holding Cargo's locks (a cargo started meanwhile waits this long).
     pub locked: Duration,
+}
+
+impl Report {
+    /// `superseded 8, unreachable 3, orphan 1`
+    pub fn breakdown(&self) -> String {
+        let parts: Vec<String> = self
+            .by_reason
+            .iter()
+            .map(|(r, n)| format!("{r} {n}"))
+            .collect();
+        parts.join(", ")
+    }
 }
 
 #[derive(Debug)]
@@ -187,7 +201,7 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
                         let dst = trash.join(moved.len().to_string());
                         match fs::rename(p, &dst) {
                             Ok(()) => moved.push(dst),
-                            Err(_) => remove_path(p),
+                            Err(_) => report.errors.extend(remove_path(p)),
                         }
                     }
                     // a plain file: unlink touches one directory, a rename would touch two
@@ -200,6 +214,7 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
             }
             report.removed.push(p.clone());
         }
+        *report.by_reason.entry(c.reason).or_default() += 1;
         if c.incremental {
             report.removed_incremental += 1;
         } else {
@@ -207,7 +222,9 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
         }
         new_deleted.push(c.id.clone());
     }
-    par_map(files, |p| remove_path(&p));
+    report
+        .errors
+        .extend(par_map(files, |p| remove_path(&p)).into_iter().flatten());
     ph.mark("delete (locked)");
     if !cfg.dry_run {
         let mut deleted = deleted_before;
@@ -231,7 +248,7 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     report.locked = start.elapsed();
     report.freed_bytes = freed + moved.iter().map(|p| size_of(p)).sum::<u64>();
     if !cfg.dry_run {
-        remove_path(&trash);
+        report.errors.extend(remove_path(&trash));
     }
     ph.mark("delete dirs (unlocked)");
     report.elapsed = start.elapsed();

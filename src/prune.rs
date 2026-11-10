@@ -9,8 +9,15 @@
 //! and are deleted. Units without a fingerprint can never be fresh for Cargo, so they are orphans.
 //! If a deleted unit comes back (two legit variants built alternately, e.g. `-p x --features y`),
 //! its group is pinned and no longer deduplicated.
+//!
+//! When the workspace `Cargo.lock` is next to `target/`, only workspace (path) packages are
+//! deduplicated; registry/git units stay only while reachable from a kept workspace unit through
+//! the `deps` edges of `.fingerprint/*/*.json` (each edge names the dependency's fingerprint value,
+//! the hex in the sibling file). That drops removed dependencies and deps of superseded units.
+//! The `rustc` hash in the json separates `clippy-driver` from `rustc` builds; a hash with no
+//! writes for `RUSTC_RETIRE` before the newest unit (old toolchain) is dropped entirely.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,9 +25,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const STATE_DIR: &str = ".autoprune";
 const CARGO_LOCKS: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
-const PIN_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-const MAX_DELETED_LINES: usize = 50_000;
+const PIN_TTL: Duration = Duration::from_secs(24 * 3600);
+/// A deleted unit rebuilt within this window was a live variant, not a revert done later.
+const PIN_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// Units built through a workspace wrapper (clippy-driver) are tagged here by hash.
+pub const TAGS_DIR: &str = "tags";
 const MAX_LOG_BYTES: u64 = 256 * 1024;
+/// A rustc/clippy-driver hash not used for this long (relative to the newest unit) is retired.
+const RUSTC_RETIRE: Duration = Duration::from_secs(14 * 24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -68,6 +80,12 @@ struct Unit {
     fp_kind: BTreeSet<String>,
     out_kind: BTreeSet<&'static str>,
     has_fingerprint: bool,
+    rustc: u64,            // hash of `rustc -vV` (differs between toolchains)
+    sig: String, // fingerprint json minus deps/local/path: features, profile, rustflags, ...
+    tag: String, // workspace wrapper that built it (clippy-driver), from TAGS_DIR
+    krate: Option<String>, // rustc crate name (stem of `deps/<crate>-H.d`), for incremental dirs
+    fp_value: Option<u64>, // this unit's fingerprint value
+    dep_values: Vec<u64>, // fingerprint values of its dependencies
     paths: Vec<PathBuf>,
     mtime: Option<SystemTime>,
 }
@@ -82,11 +100,19 @@ impl Unit {
         let name = self.name.as_deref().unwrap_or(&self.stem);
         let fp: Vec<&str> = self.fp_kind.iter().map(String::as_str).collect();
         let out: Vec<&str> = self.out_kind.iter().copied().collect();
-        format!("{name}|{}|{}", fp.join(","), out.join(","))
+        format!(
+            "{name}|{}|{}|{}|{}|{}",
+            fp.join(","),
+            out.join(","),
+            self.rustc,
+            self.tag,
+            self.sig
+        )
     }
 }
 
 struct Candidate {
+    krate: Option<String>,
     id: String, // what goes into the `deleted` log: hash or `inc:<dir>`
     paths: Vec<PathBuf>,
     mtime: Option<SystemTime>,
@@ -188,7 +214,6 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
             profile.display()
         )));
     }
-    let start = Instant::now();
     let state = profile.join(STATE_DIR);
     fs::create_dir_all(&state)?;
     let own = lock_file(&state.join("lock"))?;
@@ -198,32 +223,30 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     let Some(_cargo_locks) = acquire_cargo_locks(profile, cfg.lock_wait)? else {
         return Ok(Outcome::Busy);
     };
+    let start = Instant::now(); // prune time only, not the wait for cargo
 
     let now = SystemTime::now();
-    let deleted_before = read_lines(&state.join("deleted"));
+    let deleted_before = read_deleted(&state.join("deleted"), now);
     let mut pinned = read_pins(&state.join("pinned"), now);
-    let (units, incremental) = scan(profile);
+    let locals = local_packages(profile);
+    let (units, incremental) = scan(profile, locals.is_some());
 
     let mut report = Report::default();
     // A previously deleted unit is back: its group holds two live variants.
     for (h, u) in &units {
+        let local = locals
+            .as_ref()
+            .is_none_or(|l| l.contains(u.name.as_deref().unwrap_or("")));
         if u.has_fingerprint
-            && deleted_before.contains(h.as_str())
+            && local
+            && deleted_before.contains_key(h.as_str())
             && !pinned.contains_key(&u.group())
         {
             pinned.insert(u.group(), now);
             report.pinned_now.push(u.group());
         }
     }
-    for (dir, _, _) in &incremental {
-        let key = inc_key(dir);
-        if deleted_before.contains(&format!("inc:{dir}")) && !pinned.contains_key(&key) {
-            pinned.insert(key.clone(), now);
-            report.pinned_now.push(key);
-        }
-    }
-
-    let (doomed, kept) = plan(units, incremental, &pinned, cfg);
+    let (doomed, kept) = plan(units, incremental, &pinned, locals.as_ref(), cfg);
     let doomed = apply_cap(doomed, kept, cfg.max_size);
 
     let mut new_deleted = Vec::new();
@@ -253,7 +276,11 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     }
     report.elapsed = start.elapsed();
     if !cfg.dry_run {
-        write_deleted(&state.join("deleted"), &deleted_before, &new_deleted)?;
+        let mut deleted = deleted_before;
+        let ts = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        deleted.extend(new_deleted.into_iter().map(|id| (id, ts)));
+        write_deleted(&state.join("deleted"), &deleted)?;
+        clean_tags(&state.join(TAGS_DIR), profile);
         write_pins(&state.join("pinned"), &pinned)?;
         log(&state.join("log"), &report);
     }
@@ -262,8 +289,9 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
 
 type Incremental = Vec<(String, PathBuf, Option<SystemTime>)>;
 
-fn scan(profile: &Path) -> (BTreeMap<String, Unit>, Incremental) {
+fn scan(profile: &Path, with_sig: bool) -> (BTreeMap<String, Unit>, Incremental) {
     let mut units: BTreeMap<String, Unit> = BTreeMap::new();
+    let tags = profile.join(STATE_DIR).join(TAGS_DIR);
     for (name, path) in read_dir(&profile.join(".fingerprint")) {
         let Some((pkg, h, "")) = split_hash(&name) else {
             continue;
@@ -275,8 +303,19 @@ fn scan(profile: &Path) -> (BTreeMap<String, Unit>, Incremental) {
         u.fp_kind = read_dir(&path)
             .into_iter()
             .map(|(n, _)| n)
-            .filter(|n| n != "invoked.timestamp")
+            .filter(|n| n != "invoked.timestamp" && !n.starts_with("output-"))
             .collect();
+        if let Some(json) = u.fp_kind.iter().find(|n| n.ends_with(".json")).cloned() {
+            let text = fs::read_to_string(path.join(&json)).unwrap_or_default();
+            (u.rustc, u.dep_values) = parse_fingerprint_json(&text);
+            if with_sig {
+                u.sig = json_signature(&text);
+            }
+            u.fp_value = fs::read_to_string(path.join(json.trim_end_matches(".json")))
+                .ok()
+                .and_then(|h| parse_le_hex(h.trim()));
+        }
+        u.tag = fs::read_to_string(tags.join(h)).unwrap_or_default();
         u.touch(mtime(&path));
         u.touch(mtime(&path.join("invoked.timestamp")));
         u.paths.push(path);
@@ -288,6 +327,9 @@ fn scan(profile: &Path) -> (BTreeMap<String, Unit>, Incremental) {
         let u = units.entry(h.to_owned()).or_default();
         if u.stem.is_empty() {
             u.stem = pkg.to_owned();
+        }
+        if path.join("build-script-build").exists() {
+            u.krate = Some("build_script_build".to_owned());
         }
         u.touch(mtime(&path));
         u.paths.push(path);
@@ -304,6 +346,9 @@ fn scan(profile: &Path) -> (BTreeMap<String, Unit>, Incremental) {
             if let Some(k) = out_kind(rest, &path) {
                 u.out_kind.insert(k);
             }
+            if rest == ".d" {
+                u.krate = Some(stem.to_owned());
+            }
             u.touch(mtime(&path));
             u.paths.push(path);
         }
@@ -319,55 +364,217 @@ fn scan(profile: &Path) -> (BTreeMap<String, Unit>, Incremental) {
     (units, incremental)
 }
 
-fn inc_key(dir: &str) -> String {
-    format!("inc|{}", dir.rsplit_once('-').map_or(dir, |(c, _)| c))
-}
-
 fn plan(
     units: BTreeMap<String, Unit>,
     incremental: Incremental,
     pinned: &HashMap<String, SystemTime>,
+    locals: Option<&HashSet<String>>,
     cfg: &Config,
 ) -> (Vec<Candidate>, Vec<Candidate>) {
     let mut doomed = Vec::new();
-    let mut groups: HashMap<String, Vec<Candidate>> = HashMap::new();
+    let mut kept = Vec::new();
+    let newest_all = units
+        .values()
+        .filter(|u| u.has_fingerprint)
+        .filter_map(|u| u.mtime)
+        .max();
+    let mut rustc_newest: HashMap<u64, SystemTime> = HashMap::new();
+    for u in units.values().filter(|u| u.has_fingerprint) {
+        if let Some(t) = u.mtime {
+            let e = rustc_newest.entry(u.rustc).or_insert(t);
+            *e = (*e).max(t);
+        }
+    }
+    let retired = |u: &Unit| match (newest_all, rustc_newest.get(&u.rustc)) {
+        (Some(n), Some(&r)) => r + RUSTC_RETIRE < n,
+        _ => false,
+    };
+
+    // Build-script *run* units never reach rustc, so they inherit the clippy tag of the compiled
+    // build script they depend on.
+    let tag_by_value: HashMap<u64, String> = units
+        .values()
+        .filter(|u| !u.tag.is_empty())
+        .filter_map(|u| Some((u.fp_value?, u.tag.clone())))
+        .collect();
+    let mut units = units;
+    for u in units.values_mut() {
+        if u.tag.is_empty() && u.fp_kind.iter().any(|k| k.starts_with("run-build-script")) {
+            if let Some(t) = u.dep_values.iter().find_map(|v| tag_by_value.get(v)) {
+                u.tag = t.clone();
+            }
+        }
+    }
+
+    let mut groups: HashMap<String, Vec<(Candidate, Vec<u64>)>> = HashMap::new();
+    let mut registry: Vec<(Candidate, Option<u64>, Vec<u64>)> = Vec::new();
     for (h, u) in units {
+        let local = locals.is_none_or(|l| l.contains(u.name.as_deref().unwrap_or("")));
         let c = Candidate {
+            krate: if local { u.krate.clone() } else { None }, // only workspace crates are incremental
             id: h,
             paths: u.paths.clone(),
             mtime: u.mtime,
             incremental: false,
         };
-        if u.has_fingerprint {
-            groups.entry(u.group()).or_default().push(c);
-        } else {
+        if !u.has_fingerprint || retired(&u) {
             doomed.push(c); // no fingerprint: cargo rebuilds it anyway
+        } else if local {
+            groups.entry(u.group()).or_default().push((c, u.dep_values));
+        } else {
+            registry.push((c, u.fp_value, u.dep_values));
         }
     }
-    for (dir, path, t) in incremental {
-        groups.entry(inc_key(&dir)).or_default().push(Candidate {
-            id: format!("inc:{dir}"),
-            paths: vec![path],
-            mtime: t,
-            incremental: true,
-        });
-    }
-    let mut kept = Vec::new();
+
+    // Dedup workspace units (all units when locality is unknown).
+    let mut roots: Vec<u64> = Vec::new();
     for (key, members) in groups {
-        let newest = members.iter().filter_map(|c| c.mtime).max();
-        for c in members {
-            let stale = match (newest, c.mtime) {
-                (Some(n), Some(t)) => t + cfg.grace < n,
-                _ => false,
-            };
+        let newest = members.iter().filter_map(|(c, _)| c.mtime).max();
+        for (c, deps) in members {
+            let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n);
             if stale && !pinned.contains_key(&key) {
                 doomed.push(c);
             } else {
+                roots.extend(deps);
                 kept.push(c);
             }
         }
     }
+
+    // Registry units live only while a kept unit depends on them (transitively).
+    if !registry.is_empty() {
+        let by_value: HashMap<u64, usize> = registry
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, v, _))| v.map(|v| (v, i)))
+            .collect();
+        let mut live = vec![false; registry.len()];
+        while let Some(v) = roots.pop() {
+            if let Some(&i) = by_value.get(&v) {
+                if !live[i] {
+                    live[i] = true;
+                    roots.extend(registry[i].2.iter().copied());
+                }
+            }
+        }
+        for ((c, _, _), live) in registry.into_iter().zip(live) {
+            if live {
+                kept.push(c)
+            } else {
+                doomed.push(c)
+            }
+        }
+    }
+
+    // `incremental/<crate>-<stable id>` cannot be mapped by hash. Its session is written when its
+    // unit is compiled, so it follows the unit of the same crate with the closest mtime.
+    let mut by_crate: HashMap<&str, Vec<(SystemTime, bool)>> = HashMap::new();
+    for (list, is_doomed) in [(&doomed, true), (&kept, false)] {
+        for c in list.iter() {
+            if let (Some(k), Some(t)) = (c.krate.as_deref(), c.mtime) {
+                by_crate.entry(k).or_default().push((t, is_doomed));
+            }
+        }
+    }
+    let gap = |a: SystemTime, b: SystemTime| a.duration_since(b).unwrap_or_else(|e| e.duration());
+    let mut inc_doomed = Vec::new();
+    let mut inc_kept = Vec::new();
+    for (dir, path, t) in incremental {
+        let krate = dir.rsplit_once('-').map_or(dir.as_str(), |(c, _)| c);
+        let nearest = match (by_crate.get(krate), t) {
+            (Some(units), Some(t)) => units
+                .iter()
+                .min_by_key(|(ut, _)| gap(*ut, t))
+                .map(|&(_, d)| d),
+            _ => None,
+        };
+        let c = Candidate {
+            krate: None,
+            id: format!("inc:{dir}"),
+            paths: vec![path],
+            mtime: t,
+            incremental: true,
+        };
+        // no unit of that crate left (removed crate) or its unit is going away
+        if nearest.unwrap_or(true) {
+            inc_doomed.push(c)
+        } else {
+            inc_kept.push(c)
+        }
+    }
+    doomed.extend(inc_doomed);
+    kept.extend(inc_kept);
     (doomed, kept)
+}
+
+/// Package names without a `source` in the workspace `Cargo.lock` next to the target dir.
+fn local_packages(profile: &Path) -> Option<HashSet<String>> {
+    let target = profile
+        .ancestors()
+        .find(|a| a.join("CACHEDIR.TAG").is_file())?;
+    let lock = fs::read_to_string(target.parent()?.join("Cargo.lock")).ok()?;
+    let mut out = HashSet::new();
+    for pkg in lock.split("[[package]]").skip(1) {
+        let name = pkg
+            .lines()
+            .find_map(|l| l.strip_prefix("name = "))?
+            .trim()
+            .trim_matches('"');
+        if !pkg.lines().any(|l| l.starts_with("source = ")) {
+            out.insert(name.to_owned());
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `rustc` hash and dependency fingerprint values from a fingerprint json:
+/// `{"rustc":N,...,"deps":[[pkg_id,"name",bool,FP],...],...}`.
+fn parse_fingerprint_json(s: &str) -> (u64, Vec<u64>) {
+    let num = |t: &str| t.trim().parse::<u64>().ok();
+    let rustc = s
+        .split_once("\"rustc\":")
+        .and_then(|(_, r)| num(r.split(|c: char| !c.is_ascii_digit()).next()?))
+        .unwrap_or(0);
+    let mut deps = Vec::new();
+    if let Some((_, rest)) = s.split_once("\"deps\":[") {
+        let mut start = None;
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '[' => start = Some(i + 1),
+                ']' => match start.take() {
+                    Some(st) => deps.extend(rest[st..i].rsplit(',').next().and_then(num)),
+                    None => break, // end of the deps array
+                },
+                _ => {}
+            }
+        }
+    }
+    (rustc, deps)
+}
+
+/// What makes two builds of the same package legitimately different: everything in the json
+/// except `deps` and `local` (they embed the unit hash) and `path` (source path hash).
+fn json_signature(s: &str) -> String {
+    let head = s.split("\"deps\":").next().unwrap_or("");
+    let tail = s.split_once("\"rustflags\":").map_or("", |(_, t)| t);
+    let head: String = head
+        .split(',')
+        .filter(|f| !f.starts_with("\"path\":"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{head}{tail}")
+}
+
+/// Cargo writes fingerprint values as hex of the little-endian bytes.
+fn parse_le_hex(h: &str) -> Option<u64> {
+    if h.len() != 16 {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    for (i, byte) in b.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(u64::from_le_bytes(b))
 }
 
 /// Over the cap: delete the oldest kept units (incremental first at equal age) until under it.
@@ -438,26 +645,40 @@ fn acquire_cargo_locks(profile: &Path, wait: Duration) -> io::Result<Option<Vec<
     }
 }
 
-fn read_lines(p: &Path) -> BTreeSet<String> {
+/// `id\tunix_ts` of recent deletions; entries older than PIN_WINDOW are dropped.
+fn read_deleted(p: &Path, now: SystemTime) -> HashMap<String, u64> {
+    let horizon = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .saturating_sub(PIN_WINDOW)
+        .as_secs();
     fs::read_to_string(p)
         .unwrap_or_default()
         .lines()
-        .map(str::to_owned)
+        .filter_map(|l| {
+            let (id, ts) = l.rsplit_once('\t')?;
+            let ts: u64 = ts.parse().ok()?;
+            (ts >= horizon).then(|| (id.to_owned(), ts))
+        })
         .collect()
 }
 
-fn write_deleted(p: &Path, before: &BTreeSet<String>, new: &[String]) -> io::Result<()> {
-    if new.is_empty() {
-        return Ok(());
-    }
-    let mut lines: Vec<String> = fs::read_to_string(p)
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_owned)
+fn write_deleted(p: &Path, d: &HashMap<String, u64>) -> io::Result<()> {
+    let s: String = d.iter().map(|(id, ts)| format!("{id}\t{ts}\n")).collect();
+    atomic_write(p, &s)
+}
+
+/// Drop tag files of units that no longer exist.
+fn clean_tags(tags: &Path, profile: &Path) {
+    let live: HashSet<String> = read_dir(&profile.join(".fingerprint"))
+        .into_iter()
+        .filter_map(|(n, _)| split_hash(&n).map(|(_, h, _)| h.to_owned()))
         .collect();
-    lines.extend(new.iter().filter(|n| !before.contains(*n)).cloned());
-    let skip = lines.len().saturating_sub(MAX_DELETED_LINES);
-    atomic_write(p, &(lines[skip..].join("\n") + "\n"))
+    for (h, p) in read_dir(tags) {
+        if !live.contains(&h) {
+            let _ = fs::remove_file(p);
+        }
+    }
 }
 
 fn read_pins(p: &Path, now: SystemTime) -> HashMap<String, SystemTime> {
@@ -633,6 +854,135 @@ mod tests {
         }
     }
 
+    impl Fx {
+        /// A unit with an explicit fingerprint json: rustc hash, own value and dependency values.
+        fn node(&self, pkg: &str, h: &str, age: u64, rustc: u64, value: u64, deps: &[u64]) {
+            let fp = format!(".fingerprint/{pkg}-{h}");
+            let d: Vec<String> = deps
+                .iter()
+                .map(|v| format!("[1,\"x\",false,{v}]"))
+                .collect();
+            let json = format!(
+                "{{\"rustc\":{rustc},\"features\":\"[]\",\"deps\":[{}],\"local\":[]}}",
+                d.join(",")
+            );
+            self.file(&format!("{fp}/lib-{pkg}.json"), age);
+            fs::write(self.prof.join(format!("{fp}/lib-{pkg}.json")), json).unwrap();
+            fs::write(self.prof.join(format!("{fp}/lib-{pkg}")), hex_le(value)).unwrap();
+            set_age(&self.prof.join(format!("{fp}/lib-{pkg}")), age);
+            set_age(&self.prof.join(format!("{fp}/lib-{pkg}.json")), age);
+            set_age(&self.prof.join(&fp), age);
+            self.file(&format!("deps/lib{}-{h}.rlib", pkg.replace('-', "_")), age);
+        }
+        fn lockfile(&self, locals: &[&str], registry: &[&str]) {
+            let mut s = String::from("version = 4\n");
+            for n in locals {
+                s += &format!("\n[[package]]\nname = \"{n}\"\nversion = \"0.1.0\"\n");
+            }
+            for n in registry {
+                s += &format!("\n[[package]]\nname = \"{n}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n");
+            }
+            fs::write(self.root.join("Cargo.lock"), s).unwrap();
+        }
+    }
+
+    fn hex_le(v: u64) -> String {
+        v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn removed_registry_dep_dropped_transitive_kept() {
+        let fx = Fx::new("graph");
+        fx.lockfile(&["app"], &["serde", "serde_derive", "regex"]);
+        fx.node("app", A, 10, 1, 100, &[1]);
+        fx.node("serde", B, 9000, 1, 1, &[3]);
+        fx.node("serde_derive", C, 9000, 1, 3, &[]);
+        fx.node("regex", "dddddddddddddddd", 9000, 1, 2, &[]); // no longer a dependency
+        let r = fx.run(&cfg());
+        assert_eq!(r.removed_units, 1);
+        assert!(!fx.exists("deps/libregex-dddddddddddddddd.rlib"));
+        assert!(fx.exists(&format!("deps/libserde-{B}.rlib")));
+        assert!(fx.exists(&format!("deps/libserde_derive-{C}.rlib")));
+    }
+
+    #[test]
+    fn superseded_workspace_unit_takes_its_deps_along() {
+        let fx = Fx::new("graph2");
+        fx.lockfile(&["app"], &["libc"]);
+        fx.node("app", A, 7200, 1, 100, &[1]); // old app built against libc 0.2.190
+        fx.node("libc", B, 7200, 1, 1, &[]);
+        fx.node("app", C, 10, 1, 101, &[2]); // new app against libc 0.2.191
+        fx.node("libc", "dddddddddddddddd", 10, 1, 2, &[]);
+        assert_eq!(fx.run(&cfg()).removed_units, 2);
+        assert!(!fx.exists(&format!("deps/liblibc-{B}.rlib")));
+        assert!(fx.exists("deps/liblibc-dddddddddddddddd.rlib"));
+    }
+
+    #[test]
+    fn different_rustc_hashes_are_separate_groups() {
+        let fx = Fx::new("clippy");
+        fx.node("app", A, 7200, 1, 100, &[]); // toolchain 1
+        fx.node("app", B, 10, 2, 101, &[]); // toolchain 2
+        assert_eq!(fx.run(&cfg()).removed_units, 0);
+    }
+
+    #[test]
+    fn old_toolchain_retired() {
+        let fx = Fx::new("toolchain");
+        fx.node("app", A, 20 * 24 * 3600, 1, 100, &[]);
+        fx.node("util", B, 20 * 24 * 3600, 1, 101, &[]);
+        fx.node("app", C, 10, 2, 102, &[]);
+        assert_eq!(fx.run(&cfg()).removed_units, 2);
+        assert!(fx.exists(&format!("deps/libapp-{C}.rlib")));
+    }
+
+    #[test]
+    fn revert_after_window_is_not_pinned() {
+        let fx = Fx::new("revert");
+        fx.lib("tokio", A, 10, false); // rebuilt after a revert
+        fx.lib("tokio", B, 7200, false);
+        let old = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        fs::create_dir_all(fx.prof.join(STATE_DIR)).unwrap();
+        fs::write(
+            fx.prof.join(STATE_DIR).join("deleted"),
+            format!("{A}\t{old}\n"),
+        )
+        .unwrap();
+        let r = fx.run(&cfg());
+        assert!(r.pinned_now.is_empty());
+        assert_eq!(r.removed_units, 1); // B superseded again
+        assert!(fx.exists(&format!("deps/libtokio-{A}.rlib")));
+    }
+
+    #[test]
+    fn clippy_tag_separates_groups() {
+        let fx = Fx::new("tag");
+        fx.node("app", A, 7200, 1, 100, &[]); // cargo check
+        fx.node("app", B, 10, 1, 101, &[]); // cargo clippy: same json
+        let tags = fx.prof.join(STATE_DIR).join(TAGS_DIR);
+        fs::create_dir_all(&tags).unwrap();
+        fs::write(tags.join(B), "clippy-driver").unwrap();
+        fs::write(tags.join(C), "clippy-driver").unwrap(); // stale tag
+        assert_eq!(fx.run(&cfg()).removed_units, 0);
+        assert!(!tags.join(C).exists() && tags.join(B).exists());
+    }
+
+    #[test]
+    fn fingerprint_json_parsing() {
+        let j = r#"{"rustc":139,"features":"[]","deps":[[13,"build_script_build",false,49],[49,"util",false,15]],"local":[{"CheckDepInfo":{"dep_info":"x","checksum":false}}]}"#;
+        assert_eq!(parse_fingerprint_json(j), (139, vec![49, 15]));
+        assert_eq!(
+            parse_fingerprint_json(r#"{"rustc":1,"deps":[],"local":[]}"#),
+            (1, vec![])
+        );
+        assert_eq!(parse_le_hex("d5dd8855943b3fe2"), Some(16302814684380716501));
+        assert_eq!(parse_le_hex("xyz"), None);
+    }
+
     #[test]
     fn split_hash_cases() {
         assert_eq!(
@@ -756,17 +1106,24 @@ mod tests {
     }
 
     #[test]
-    fn incremental_dedup() {
+    fn incremental_follows_its_unit() {
         let fx = Fx::new("inc");
-        fx.dir("incremental/gs_modem-1abc/s-old", 7200);
-        set_age(&fx.prof.join("incremental/gs_modem-1abc"), 7200);
-        fx.dir("incremental/gs_modem-2def/s-new", 10);
-        set_age(&fx.prof.join("incremental/gs_modem-2def"), 10);
-        fx.dir("incremental/other-3xyz", 7200);
+        fx.lib("gs_modem", A, 7200, false);
+        fx.lib("gs_modem", B, 10, false);
+        fx.lib("gs_at", C, 9000, false); // old but the only copy: live
+        for (d, age) in [
+            ("gs_modem-1abc", 7200),
+            ("gs_modem-2def", 10),
+            ("gs_at-3xyz", 9000),
+            ("removed-4qqq", 10),
+        ] {
+            fx.dir(&format!("incremental/{d}/s-x"), age);
+            set_age(&fx.prof.join(format!("incremental/{d}")), age);
+        }
         let r = fx.run(&cfg());
-        assert_eq!(r.removed_incremental, 1);
-        assert!(!fx.exists("incremental/gs_modem-1abc") && fx.exists("incremental/gs_modem-2def"));
-        assert!(fx.exists("incremental/other-3xyz"));
+        assert_eq!(r.removed_incremental, 2);
+        assert!(!fx.exists("incremental/gs_modem-1abc") && !fx.exists("incremental/removed-4qqq"));
+        assert!(fx.exists("incremental/gs_modem-2def") && fx.exists("incremental/gs_at-3xyz"));
     }
 
     #[test]

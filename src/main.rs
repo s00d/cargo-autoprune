@@ -114,10 +114,53 @@ fn profile_of(out: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// `-C extra-filename=-<hash>` → `<hash>`.
+fn unit_hash(args: &[OsString]) -> Option<String> {
+    let mut prev_c = false;
+    for a in args.iter().filter_map(|a| a.to_str()) {
+        let v = if prev_c {
+            Some(a)
+        } else {
+            a.strip_prefix("-C")
+        };
+        prev_c = a == "-C";
+        if let Some(h) = v.and_then(|v| v.strip_prefix("extra-filename=-")) {
+            return Some(h.to_owned());
+        }
+    }
+    None
+}
+
+/// clippy-driver (RUSTC_WORKSPACE_WRAPPER) units have the same fingerprint json as plain
+/// `check` units; tag them so the pruner keeps both variants. Costs nothing for plain rustc.
+fn tag_workspace_wrapper(args: &[OsString], profile: &Path) {
+    // cargo-clippy exports RUSTC_WORKSPACE_WRAPPER; it changes the hash of every workspace unit,
+    // including build scripts that cargo compiles with plain rustc.
+    let ws = env::var_os("RUSTC_WORKSPACE_WRAPPER").filter(|w| !w.is_empty());
+    let prog = match ws
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(Path::new(&args[0]))
+        .file_stem()
+    {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => return,
+    };
+    if prog.starts_with("rustc") {
+        return;
+    }
+    if let Some(h) = unit_hash(args) {
+        let dir = profile.join(prune::STATE_DIR).join(prune::TAGS_DIR);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(h), prog);
+    }
+}
+
 fn maybe_trigger(args: &[OsString]) {
     let Some(profile) = out_dir(args).as_deref().and_then(profile_of) else {
         return;
     };
+    tag_workspace_wrapper(args, &profile);
     let stamp = profile.join(STAMP);
     let interval = env_secs("CARGO_AUTOPRUNE_INTERVAL", DEFAULT_INTERVAL);
     let fresh = std::fs::metadata(&stamp)
@@ -287,6 +330,23 @@ mod tests {
         let b: Vec<OsString> = vec!["--out-dir=/t/x".into()];
         assert_eq!(out_dir(&b), Some(PathBuf::from("/t/x")));
         assert_eq!(out_dir(&["-vV".into()]), None);
+    }
+
+    #[test]
+    fn finds_unit_hash() {
+        let a: Vec<OsString> = [
+            "--crate-name",
+            "x",
+            "-C",
+            "extra-filename=-0123456789abcdef",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(unit_hash(&a).as_deref(), Some("0123456789abcdef"));
+        let b: Vec<OsString> = vec!["-Cextra-filename=-aa".into()];
+        assert_eq!(unit_hash(&b).as_deref(), Some("aa"));
+        assert_eq!(unit_hash(&["-C".into(), "opt-level=0".into()]), None);
     }
 
     #[test]

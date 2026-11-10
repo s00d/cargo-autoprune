@@ -38,6 +38,7 @@ fn two_major_versions_side_by_side() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn dev_and_build_dependencies() {
     let ws = Ws::new("devbuild");
     step(
@@ -49,6 +50,7 @@ fn dev_and_build_dependencies() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn optional_dependency_behind_a_feature() {
     let ws = Ws::new("optional");
     let with = "dep_c = { version = \"1\", optional = true }\n[features]\ndefault = [\"fast\"]\nfast = [\"dep_c\"]";
@@ -70,6 +72,7 @@ fn optional_dependency_behind_a_feature() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn target_specific_dependency() {
     let ws = Ws::new("cfgdep");
     step(&ws, "[target.'cfg(unix)'.dependencies]\ndep_c = \"1\"\n[target.'cfg(windows)'.dependencies]\ndep_a = \"1\"");
@@ -77,6 +80,7 @@ fn target_specific_dependency() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn path_dependency_outside_the_workspace() {
     let ws = Ws::new("outside");
     let ext = ws.root.join("ext");
@@ -98,6 +102,7 @@ fn path_dependency_outside_the_workspace() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn patched_registry_crate() {
     let ws = Ws::new("patch");
     let patched = ws.root.join("patched_a");
@@ -129,6 +134,7 @@ fn patched_registry_crate() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn inherited_workspace_dependencies() {
     let ws = Ws::new("inherit");
     let workspace = |v: &str| {
@@ -144,6 +150,7 @@ fn inherited_workspace_dependencies() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn git_dependency() {
     if Command::new("git").arg("--version").output().is_err() {
         eprintln!("git not installed, skipped");

@@ -14,11 +14,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      # target/ and the registry are cached; the last step trims target/ with this repo's own
+      # action before the cache post-step saves it (dogfooding: the cache never grows)
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: cargo-${{ runner.os }}-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo test -- --include-ignored
         env:
           RUST_BACKTRACE: "1"
+      - name: use the binary the tests just built (no extra cargo install)
+        if: always()
+        shell: bash
+        run: echo "$PWD/target/debug" >> "$GITHUB_PATH"
+      - uses: ./
+        if: always()
+        with:
+          args: --verbose
   action:
     # the composite action on a real target: build, change the version (every unit rehashes),
     # build again, prune, and check that the next build compiles nothing

@@ -28,6 +28,7 @@ fn step(ws: &Ws, deps: &str, cmds: &[&str]) {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn dependency_version_bump() {
     let ws = Ws::new("bump");
     step(&ws, A10, CMDS);
@@ -39,6 +40,7 @@ fn dependency_version_bump() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn added_and_removed_dependencies() {
     let ws = Ws::new("addrm");
     step(&ws, A10, CMDS);
@@ -49,6 +51,7 @@ fn added_and_removed_dependencies() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn transitive_dependency_bump_through_build_script_crate() {
     let ws = Ws::new("transitive");
     step(&ws, &format!("{A10}\ndep_b = \"1\""), CMDS);
@@ -56,6 +59,7 @@ fn transitive_dependency_bump_through_build_script_crate() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn registry_feature_change() {
     let ws = Ws::new("feature");
     step(&ws, "dep_c = \"1\"", CMDS);
@@ -68,6 +72,7 @@ fn registry_feature_change() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn workspace_source_edits_keep_cache() {
     let ws = Ws::new("edit");
     step(&ws, A10, CMDS);
@@ -87,6 +92,7 @@ fn workspace_source_edits_keep_cache() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn feature_variants_of_workspace_member_coexist() {
     // `-p util --features extra` and the plain workspace build are two live variants of util.
     let cmds = &[
@@ -106,6 +112,7 @@ fn feature_variants_of_workspace_member_coexist() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn feature_unification_alternation_is_pinned_not_thrashed() {
     // `tool` turns on util/extra; `-p app` alone builds app against plain util, `--workspace`
     // against util+extra: same app config, different deps. Only timing tells these apart.
@@ -134,6 +141,7 @@ fn feature_unification_alternation_is_pinned_not_thrashed() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn check_build_test_release_and_doc() {
     let cmds = &[
         "bench --workspace --no-run",
@@ -148,6 +156,7 @@ fn check_build_test_release_and_doc() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn clippy_and_check_coexist() {
     if !has_clippy() {
         eprintln!("cargo clippy not installed, skipped");
@@ -164,6 +173,7 @@ fn clippy_and_check_coexist() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn revert_an_hour_later_is_deduplicated() {
     let ws = Ws::new("revert");
     step(&ws, A10, CMDS);
@@ -377,6 +387,7 @@ fn cli_dry_run_and_prune() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn custom_profile_and_explicit_target_triple() {
     let ws = Ws::new("triple");
     ws.write(
@@ -403,6 +414,7 @@ fn custom_profile_and_explicit_target_triple() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn rustflags_change() {
     let ws = Ws::new("rustflags");
     let cmds = &CMDS[..2];
@@ -447,6 +459,7 @@ fn rustflags_change() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn removed_workspace_member_and_renamed_bin() {
     let ws = Ws::new("member");
     ws.write(
@@ -492,6 +505,7 @@ fn removed_workspace_member_and_renamed_bin() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn toolchain_switch_and_retirement() {
     let Some(old) = other_toolchain_rustc() else {
         eprintln!("no second toolchain installed, skipped");
@@ -549,6 +563,7 @@ fn other_toolchain_rustc() -> Option<String> {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn separate_build_dir() {
     // `build.build-dir`: intermediates live outside target/, profile dirs have only .cargo-build-lock
     let ws = Ws::new("builddir");
@@ -603,6 +618,7 @@ fn separate_build_dir() {
 }
 
 #[test]
+#[ignore = "slow (oracle builds): cargo test -- --include-ignored"]
 fn two_workspaces_share_one_target_dir() {
     // same package names (app, util) in both: they must not evict each other
     let a = Ws::new("share-a");

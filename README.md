@@ -298,7 +298,8 @@ pruner, every step keeps all of its copies.
 ## Tests
 
 ```bash
-cargo test                      # 31 unit tests + 32 end-to-end tests with real cargo
+cargo test                      # fast: 35 unit + 13 end-to-end tests (~15 s)
+cargo test -- --include-ignored # all 71: the slow multi-step scenarios too (CI runs these)
 python3 scripts/bench-tree.py /tmp/bench && CARGO_AUTOPRUNE_TRACE=1 cargo autoprune --dry-run /tmp/bench
 scripts/self-test.sh            # self-cleaning on this crate
 scripts/churn-test.sh           # real crates.io crates vs oracle (needs them in ~/.cargo/registry)

@@ -184,23 +184,39 @@ until the size cap evicts them.
 
 ## Comparison
 
-**Head to head on a real workspace: cargo-autoprune wins on every row.** The test project is vld:
-695 crates, a 5 GB target. Scenario: bump `itoa` in `Cargo.lock`, build, prune, then
-1. compare the target with one built from scratch, and
-2. build again.
+**Head to head on real projects.**
 
-cargo-sweep frees a little less, leaves garbage, and deletes artifacts the current build still
-uses, so the next build recompiles the whole workspace. cargo-autoprune leaves exactly what a clean
-build would produce, and the next build compiles nothing.
+Scenario: bump `memchr` (or `itoa`) in `Cargo.lock`, build, prune. Then compare the result with a
+target built from scratch with the same commands (the *ideal*) and build again. "More deleted" is
+only better while nothing live goes with it: anything below the ideal is rebuilt on the next build.
+
+tauri-plugin-widgets (235 crates):
 
 | | cargo-autoprune | cargo-sweep 0.8 (`--stamp` / `--file`) |
 |---|---|---|
-| Space freed (more is better) | ✅ **3.0 GiB** | 2.85 GiB |
-| Garbage left behind (fewer is better) | ✅ **0 files** | 196 files |
-| Live files wrongly deleted (fewer is better) | ✅ **0** | 2,799 |
-| Crates the next build recompiles (fewer is better) | ✅ **0** | 694 of 695 (full rebuild) |
-| Scan time, dry run (less is better) | ✅ **0.18–0.21 s** | 0.47–0.74 s |
-| Safe while cargo runs | ✅ yes: takes cargo's locks, waits for the cargo command to end, 1 s batches | no |
+| target before the prune | 6,534 files, 1,916 MB | 6,534 files, 1,914 MB |
+| deleted | 1,782 files, 521 MB | 5,021 files, 1,633 MB |
+| left | 4,752 files, 1,395 MB | 1,513 files, 281 MB |
+| ideal (clean build) | 4,489 files, 1,392 MB | 4,489 files, 1,394 MB |
+| garbage left, vs the ideal (fewer is better) | ✅ **0** | 6 files |
+| live files deleted, vs the ideal (fewer is better) | ✅ **0** | 1,449 |
+| next build recompiles (fewer is better) | ✅ **0 crates** | 235 of 235: the whole project |
+| prune time | ✅ **0.24 s** | 0.80 s |
+
+cargo-autoprune lands on the ideal size (1,395 MB vs 1,392 MB). cargo-sweep deletes everything it
+can't prove used, ends at 281 MB, and the next build recompiles all 235 crates to grow back to
+1.4 GB.
+
+vld (695 crates, 5 GB target), `itoa` bump:
+
+| | cargo-autoprune | cargo-sweep 0.8 |
+|---|---|---|
+| target before → after the prune | 7,966 → 4,877 MB (ideal 4,919 MB) | 7,999 → 5,065 MB (ideal 4,929 MB) |
+| freed | 3.0 GiB | 2.85 GiB |
+| garbage left / live deleted | ✅ **0 / 0** | 196 / 2,799 files |
+| next build recompiles | ✅ **0 crates** | 694 of 695 |
+| scan time, dry run | ✅ **0.18–0.21 s** | 0.47–0.74 s |
+| safe while cargo runs | ✅ cargo's locks, waits for the cargo command, 1 s batches | no |
 
 cargo-sweep's stamp mode trusts access times. cargo doesn't update them for files it only checks
 (and macOS or Linux with `noatime` don't track them at all), so live artifacts look unused.

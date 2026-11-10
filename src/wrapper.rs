@@ -104,7 +104,8 @@ fn record_unit(args: &[OsString], profile: &Path) {
         return;
     };
     let Some(dir) = dir.to_str() else { return };
-    if dir.contains("/registry/src/") || dir.contains("/git/checkouts/") {
+    let d = dir.replace('\\', "/"); // Windows separators
+    if d.contains("/registry/src/") || d.contains("/git/checkouts/") {
         return;
     }
     let Some(h) = unit_hash(args) else { return };

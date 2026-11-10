@@ -134,7 +134,7 @@ pub(crate) fn scan(
                 u.out_kind.insert(k);
             }
             if rest == ".rmeta" || rest.ends_with(".rcgu.o") {
-                u.inodes.push(e.ino);
+                u.inodes.extend(e.ino);
             }
             if rest == ".d" {
                 u.krate = Some(stem.to_owned());
@@ -154,7 +154,7 @@ pub(crate) fn scan(
             .filter(|s| s.is_dir && s.name.starts_with("s-"))
             .flat_map(|s| entries(&s.path))
             .filter(|f| f.name.ends_with(".o") || f.name == "metadata.rmeta")
-            .map(|f| f.ino)
+            .filter_map(|f| f.ino)
             .collect();
         let t = mtime(&e.path);
         (e.name, e.path, t, inodes)

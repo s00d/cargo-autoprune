@@ -56,8 +56,9 @@ pub(crate) fn read_pins(p: &Path, now: SystemTime) -> HashMap<String, SystemTime
         .lines()
         .filter_map(|l| {
             let (k, ts) = l.rsplit_once('\t')?;
-            let t = UNIX_EPOCH + Duration::from_secs(ts.parse().ok()?);
-            (t + PIN_TTL > now).then(|| (k.to_owned(), t))
+            // checked: a corrupt timestamp must not panic every background prune
+            let t = UNIX_EPOCH.checked_add(Duration::from_secs(ts.parse().ok()?))?;
+            (t.checked_add(PIN_TTL)? > now).then(|| (k.to_owned(), t))
         })
         .collect()
 }
@@ -170,6 +171,20 @@ mod tests {
         assert!(n[0].contains("could not delete 1 path(s)"));
         assert!(n[1].contains("freed 3.0GiB") && n[1].contains("superseded 7"));
         assert!(n[2].contains("9 s"));
+    }
+
+    #[test]
+    fn corrupt_pin_timestamps_are_ignored() {
+        let d = std::env::temp_dir().join(format!("autoprune-pins-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let f = d.join("pinned");
+        fs::write(
+            &f,
+            format!("a|b\t{}\nc|d\tnot-a-number\ne|f\t42\n", u64::MAX),
+        )
+        .unwrap();
+        assert!(read_pins(&f, SystemTime::now()).is_empty());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

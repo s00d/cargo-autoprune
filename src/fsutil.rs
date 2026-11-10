@@ -11,7 +11,7 @@ pub(crate) struct Entry {
     pub(crate) path: PathBuf,
     pub(crate) is_dir: bool,
     /// Inode (unix, from `d_ino`); incremental work products are hard links to `deps/` files.
-    pub(crate) ino: u64,
+    pub(crate) ino: Option<u64>, // None off unix: no inode, owners fall back to mtime pairing
 }
 
 pub(crate) fn entries(p: &Path) -> Vec<Entry> {
@@ -31,13 +31,13 @@ pub(crate) fn entries(p: &Path) -> Vec<Entry> {
 }
 
 #[cfg(unix)]
-fn ino(e: &fs::DirEntry) -> u64 {
+fn ino(e: &fs::DirEntry) -> Option<u64> {
     use std::os::unix::fs::DirEntryExt;
-    e.ino()
+    Some(e.ino())
 }
 #[cfg(not(unix))]
-fn ino(_: &fs::DirEntry) -> u64 {
-    0
+fn ino(_: &fs::DirEntry) -> Option<u64> {
+    None
 }
 
 /// Map `f` over `items` on a few threads (the work is syscall-bound: open/read/readdir).

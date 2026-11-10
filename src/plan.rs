@@ -201,7 +201,9 @@ pub(crate) fn plan(
             }
         }
         for ((c, _, _), live) in registry.into_iter().zip(live) {
-            if live {
+            // defense in depth: a unit written within the grace period is never "unreachable"
+            let recent = matches!((newest_all, c.mtime), (Some(n), Some(t)) if t + cfg.grace >= n);
+            if live || recent {
                 kept.push(c)
             } else {
                 doomed.push(Candidate {

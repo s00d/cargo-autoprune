@@ -100,7 +100,7 @@ fn feature_variants_of_workspace_member_coexist() {
     }
     assert_eq!(ws.run_all(cmds), 0);
     ws.assert_clean(cmds);
-    assert!(ws.pins() > 0, "alternating feature variants are pinned");
+    assert_eq!(ws.pins(), 0, "told apart by features: no thrash, no pin");
 }
 
 #[test]
@@ -418,15 +418,29 @@ fn rustflags_change() {
     }
     let (a, b) = (inventory(&ws.target), inventory(&oracle));
     let lost: Vec<_> = b.difference(&a).collect();
-    let left: Vec<_> = a.difference(&b).collect();
     assert!(lost.is_empty(), "{lost:#?}");
-    assert!(
-        left.is_empty(),
-        "builds without the flags are superseded: {left:#?}"
-    );
     for c in cmds {
         assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &env), 0);
     }
+    // the build without flags stays as a variant; a week later, with the flagged one still in
+    // use, it expires
+    age_tree(&ws.target, 8 * 24 * 3600);
+    ws.write("util/src/lib.rs", "pub fn u() -> u32 { 5 }\n");
+    for c in cmds {
+        ws.cargo_in(c, &ws.target.clone(), true, &env);
+    }
+    ws.prune();
+    let (a, b) = (
+        inventory(&ws.target),
+        inventory(&oracle_rebuild(&ws, cmds, &env)),
+    );
+    let left: Vec<_> = a.difference(&b).collect();
+    let lost: Vec<_> = b.difference(&a).collect();
+    assert!(lost.is_empty(), "{lost:#?}");
+    assert!(
+        left.is_empty(),
+        "the stale no-flags variant should expire: {left:#?}"
+    );
 }
 
 #[test]
@@ -626,6 +640,15 @@ fn two_workspaces_share_one_target_dir() {
     assert!(left.is_empty(), "removed dependency kept: {left:?}");
     assert_eq!(all(&a), 0);
     assert_eq!(all(&b), 0);
+}
+
+fn oracle_rebuild(ws: &Ws, cmds: &[&str], env: &[(&str, &str)]) -> std::path::PathBuf {
+    let oracle = ws.root.join("oracle-again");
+    let _ = fs::remove_dir_all(&oracle);
+    for c in cmds {
+        ws.cargo_in(c, &oracle, false, env);
+    }
+    oracle
 }
 
 fn host_triple() -> String {

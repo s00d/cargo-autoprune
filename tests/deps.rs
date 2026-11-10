@@ -54,7 +54,19 @@ fn optional_dependency_behind_a_feature() {
     let with = "dep_c = { version = \"1\", optional = true }\n[features]\ndefault = [\"fast\"]\nfast = [\"dep_c\"]";
     let without = "dep_c = { version = \"1\", optional = true }\n[features]\nfast = [\"dep_c\"]";
     step(&ws, with);
-    step(&ws, without);
+    // the default feature set changes: the old variant stays (it could be `--features fast`)...
+    ws.deps(without);
+    ws.run_all(CMDS);
+    ws.prune();
+    let (_, lost) = ws.oracle_diff(CMDS);
+    assert!(lost.is_empty(), "{lost:#?}");
+    assert_eq!(ws.run_all(CMDS), 0);
+    // ...until a week passes in which only the new one is rebuilt
+    age_tree(&ws.target, 8 * 24 * 3600);
+    ws.write("app/src/lib.rs", "pub fn app() -> u32 { util::u() + 1 }\n");
+    ws.run_all(CMDS);
+    ws.prune();
+    ws.assert_clean(CMDS);
 }
 
 #[test]

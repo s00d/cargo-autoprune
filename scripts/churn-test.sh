@@ -32,12 +32,12 @@ deps() { # $1 = dependency lines for app
   { print '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\nutil = { path = "../util" }'; print -r -- "$1"; } > app/Cargo.toml
 }
 cmds() { # same command set for the pruned and the oracle target
-  cargo build --offline -q --workspace --all-targets &&
-  cargo test --offline -q --workspace --no-run &&
-  cargo check --offline -q --workspace &&
-  cargo build --offline -q -p util --features extra &&
-  cargo clippy --offline -q --workspace &&
-  cargo build --offline -q --release -p app
+  cargo build --offline --workspace --all-targets &&
+  cargo test --offline --workspace --no-run &&
+  cargo check --offline --workspace &&
+  cargo build --offline -p util --features extra &&
+  cargo clippy --offline --workspace &&
+  cargo build --offline --release -p app
 }
 waitbg() { for i in {1..300}; do pgrep -qf 'cargo-autoprune --background' || return 0; sleep 0.2; done; echo "  background prune still running"; }
 inventory() { # every entry that cargo/autoprune manage, one per line, relative to target

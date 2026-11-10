@@ -72,7 +72,10 @@ of that crate. Without a terminal (IDE, CI) the notices stay for `cargo autoprun
 3. **Lock.** The background process takes every Cargo lock of the profile dir (`.cargo-lock`,
    `.cargo-build-lock`, `.cargo-artifact-lock`). It takes all of them or none, so it can't deadlock with
    Cargo. It waits until the running build finishes and holds the locks while it deletes, so no Cargo
-   build can start meanwhile. A second pruner exits at once.
+   build can start meanwhile. A second pruner exits at once. A `--target` build holds the host
+   profile's lock too (checked), so build scripts and proc-macros in `target/debug` are safe while a
+   cross build runs. As an extra guard, registry units written within the grace period are never
+   treated as unreachable.
 4. **Prune.**
    - The scan takes no `stat` per file in `deps/`: names, file types and inodes come from `readdir`.
    - Fingerprints and incremental sessions are read on several threads.
@@ -93,8 +96,8 @@ A *unit* is everything with one metadata hash `H`: `.fingerprint/<pkg>-H/`, `bui
 |---|---|
 | Units with no fingerprint (orphans, e.g. `.o`/`.d` left after an executable was deleted) | Always. Cargo can never consider them fresh |
 | Units of removed or renamed targets (bin, test, example, build script) | The crate root named first in the unit's rustc dep-info file no longer exists. A build-script run goes with its compiled build script |
-| Superseded workspace units | Grouped by package, target kind (lib, test, bin, example, build-script compile/run), outputs (`rlib` or `check` rmeta), profile, host/target, rustc hash, clippy tag and workspace. In each group, copies older than the newest by more than the grace period go. Features, `RUSTFLAGS` and config are *not* part of the group: a change there supersedes the old build |
-| Stale variants | A profile or host variant of a package that hasn't been rebuilt for 7 days while the package has |
+| Superseded workspace units | Grouped by package, target kind (lib, test, bin, example, build-script compile/run), outputs (`rlib` or `check` rmeta), the fingerprint signature (features, profile, `RUSTFLAGS`, config, host/target), rustc hash, clippy tag and workspace. In each group, copies older than the newest by more than the grace period go. So `-p x --features y` next to a plain build never thrash |
+| Stale variants | A variant of a package (other features, `RUSTFLAGS`, profile or host) that hasn't been rebuilt for 7 days while the package has, e.g. the old build after an edit of `[features]` |
 | Registry/git units | Kept only while a kept workspace unit depends on them, transitively, through the `deps` edges in `.fingerprint/*/*.json`. Edges from the other profile dirs of the same target count too, because with `--target` the build scripts and proc-macros live in the host profile. Removed dependencies, old versions and old feature sets go automatically. A removed workspace member is no longer in `Cargo.lock`, so it is treated the same way |
 | Old toolchains | A rustc hash with no writes for 14 days before the newest unit is dropped |
 | `incremental/<crate>-<id>/` | Follows its unit. The session's work products are hard links to the unit's `.rmeta` / `.rcgu.o` in `deps/`, so the inode identifies the owner. Without a shared inode (Linux deletes a binary's objects), units and dirs of the crate are paired one-to-one, closest mtime first. Dirs left without a unit are deleted |
@@ -109,9 +112,8 @@ never a broken build.
 
 - `clippy` units have the same json as `check` units. The wrapper tags units compiled while
   `RUSTC_WORKSPACE_WRAPPER` is set, a file write that happens only under clippy.
-- `cargo build -p x --features y`, or `-p x` vs `--workspace` with different feature unification,
-  builds a crate in two live variants. An edit of `[features]` produces the same picture, but there
-  the old build is dead.
+- `cargo build -p x` vs `cargo build --workspace` resolve features differently, so a crate is built
+  against different dependencies: same config, different deps. A dependency bump looks the same.
 
 For the second case only timing helps. The pruner remembers deletions for 24 hours. A deleted unit
 that gets rebuilt is a *comeback*:
@@ -236,7 +238,7 @@ pruner, every step keeps all of its copies.
 ## Tests
 
 ```bash
-cargo test                      # 30 unit tests + 32 end-to-end tests with real cargo
+cargo test                      # 31 unit tests + 32 end-to-end tests with real cargo
 python3 scripts/bench-tree.py /tmp/bench && CARGO_AUTOPRUNE_TRACE=1 cargo autoprune --dry-run /tmp/bench
 scripts/self-test.sh            # self-cleaning on this crate
 scripts/churn-test.sh           # real crates.io crates vs oracle (needs them in ~/.cargo/registry)

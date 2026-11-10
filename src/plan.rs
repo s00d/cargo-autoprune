@@ -101,12 +101,17 @@ pub(crate) fn plan(
     }
 
     type Member = (Candidate, Vec<u64>, Option<PathBuf>);
+    // Registry units of a version that is not in Cargo.lock any more are dead, and so is every
+    // unit built against one (transitively): after a revert cargo reuses the *older* copies, so
+    // "newest wins" alone would keep the dead ones.
+    let dead = ws.map(|w| outdated_units(&units, w)).unwrap_or_default();
     let lock_changed = ws.and_then(|w| w.lock_changed);
     let before_lock =
         |t: SystemTime, newest: SystemTime| lock_changed.is_some_and(|l| t < l && newest >= l);
     let mut groups: HashMap<String, Vec<Member>> = HashMap::new();
     let mut registry: Vec<(Candidate, Option<u64>, Vec<u64>)> = Vec::new();
     for (h, u) in units {
+        let is_dead = dead.contains(&h);
         let local = ws.is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
         let c = Candidate {
             krate: if local { u.krate.clone() } else { None }, // only workspace crates are incremental
@@ -118,7 +123,12 @@ pub(crate) fn plan(
             reason: "",
             guard: u.guard.clone(),
         };
-        if !u.has_fingerprint {
+        if is_dead {
+            doomed.push(Candidate {
+                reason: "outdated dependency",
+                ..c
+            });
+        } else if !u.has_fingerprint {
             doomed.push(Candidate {
                 reason: "orphan",
                 ..c
@@ -318,6 +328,40 @@ pub(crate) fn plan(
     doomed.extend(inc_doomed);
     kept.extend(inc_kept);
     (doomed, kept)
+}
+
+/// Hashes of units whose registry version is not in the lock files, plus every unit that depends
+/// on one of them, transitively.
+fn outdated_units(units: &BTreeMap<String, Unit>, ws: &Workspace) -> HashSet<String> {
+    let registry: Vec<(&String, &Unit)> = units
+        .iter()
+        .filter(|(_, u)| u.has_fingerprint && u.dep_info.is_some())
+        .filter(|(_, u)| !ws.is_local(u.name.as_deref().unwrap_or("")))
+        .collect();
+    let versions = par_map(registry, |(h, u)| {
+        let name = u.name.as_deref().unwrap_or("");
+        let v = crate::fingerprint::source_version(u.dep_info.as_ref()?, name)?;
+        let current = ws.versions.get(name)?;
+        (!current.contains(&v)).then(|| h.clone())
+    });
+    let mut dead: HashSet<String> = versions.into_iter().flatten().collect();
+    let mut dead_values: HashSet<u64> = dead.iter().filter_map(|h| units[h].fp_value).collect();
+    loop {
+        let more: Vec<&String> = units
+            .iter()
+            .filter(|(h, u)| {
+                !dead.contains(*h) && u.dep_values.iter().any(|v| dead_values.contains(v))
+            })
+            .map(|(h, _)| h)
+            .collect();
+        if more.is_empty() {
+            return dead;
+        }
+        for h in more {
+            dead_values.extend(units[h].fp_value);
+            dead.insert(h.clone());
+        }
+    }
 }
 
 /// Build-script compile or run unit (`build-script-build-script-build`, `run-build-script-...`).

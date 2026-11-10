@@ -11,6 +11,8 @@ pub(crate) struct Workspace {
     /// Dirs holding a workspace `Cargo.lock` (several when a target dir is shared).
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) locals: HashSet<String>,
+    /// Versions of every registry/git package in the lock files: `serde` -> {"1.0.228"}.
+    pub(crate) versions: HashMap<String, HashSet<String>>,
     /// When a `Cargo.lock` last changed (cargo rewrites it only when its content changes).
     pub(crate) lock_changed: Option<std::time::SystemTime>,
 }
@@ -115,10 +117,13 @@ pub(crate) fn workspace(profile: &Path) -> (Option<Workspace>, HashMap<String, P
         }
     }
     let mut locals = HashSet::new();
+    let mut versions: HashMap<String, HashSet<String>> = HashMap::new();
     for r in &roots {
-        locals.extend(local_names(
-            &fs::read_to_string(r.join("Cargo.lock")).unwrap_or_default(),
-        ));
+        let lock = fs::read_to_string(r.join("Cargo.lock")).unwrap_or_default();
+        locals.extend(local_names(&lock));
+        for (name, version) in source_versions(&lock) {
+            versions.entry(name).or_default().insert(version);
+        }
     }
     let lock_changed = roots
         .iter()
@@ -131,6 +136,7 @@ pub(crate) fn workspace(profile: &Path) -> (Option<Workspace>, HashMap<String, P
     let ws = (!locals.is_empty()).then_some(Workspace {
         roots,
         locals,
+        versions,
         lock_changed,
     });
     (ws, homes)
@@ -144,6 +150,41 @@ pub(crate) fn recorded_units(profile: &Path) -> HashMap<String, PathBuf> {
         .filter_map(|l| l.split_once('\t'))
         .map(|(h, d)| (h.to_owned(), PathBuf::from(d)))
         .collect()
+}
+
+/// `(name, version)` of packages with a `source` (registry, git) in a `Cargo.lock`.
+fn source_versions(lock: &str) -> Vec<(String, String)> {
+    let field = |pkg: &str, key: &str| {
+        pkg.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().trim_matches('"').to_owned())
+    };
+    lock.split("[[package]]")
+        .skip(1)
+        .filter(|pkg| pkg.lines().any(|l| l.starts_with("source = ")))
+        .filter_map(|pkg| Some((field(pkg, "name = ")?, field(pkg, "version = ")?)))
+        .collect()
+}
+
+/// Version of a registry package from where its sources live, read from the unit's rustc
+/// dep-info: `.../registry/src/<index>/memchr-2.8.2/src/lib.rs` -> `2.8.2`.
+pub(crate) fn source_version(dep_info: &Path, pkg: &str) -> Option<String> {
+    let src = first_dependency(&fs::read_to_string(dep_info).ok()?)?;
+    let prefix = format!("{pkg}-");
+    Path::new(&src).components().find_map(|c| {
+        let v = c.as_os_str().to_str()?.strip_prefix(&prefix)?;
+        // semver `1.2.3[-pre]`: git checkouts are `<name>-<hash>`, which is no version
+        let numeric = |p: Option<&str>| {
+            p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let mut parts = v.splitn(3, '.');
+        let ok = numeric(parts.next())
+            && numeric(parts.next())
+            && parts
+                .next()
+                .is_some_and(|p| p.starts_with(|ch: char| ch.is_ascii_digit()));
+        ok.then(|| v.to_owned())
+    })
 }
 
 fn local_names(lock: &str) -> Vec<String> {
@@ -240,6 +281,31 @@ mod tests {
                 "{from}"
             );
         }
+    }
+
+    #[test]
+    fn version_from_source_path() {
+        let d = std::env::temp_dir().join(format!("autoprune-ver-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let f = d.join("x.d");
+        fs::write(&f, "/t/x.d: /h/registry/src/idx/memchr-2.8.2/src/lib.rs\n").unwrap();
+        assert_eq!(source_version(&f, "memchr").as_deref(), Some("2.8.2"));
+        fs::write(
+            &f,
+            "/t/x.d: /h/git/checkouts/dep_g-63d23441bb5565a0/abc1234/src/lib.rs\n",
+        )
+        .unwrap();
+        assert_eq!(source_version(&f, "dep_g"), None);
+        fs::write(
+            &f,
+            "/t/x.d: /h/registry/src/idx/proc-macro2-1.0.95-rc.1/src/lib.rs\n",
+        )
+        .unwrap();
+        assert_eq!(
+            source_version(&f, "proc-macro2").as_deref(),
+            Some("1.0.95-rc.1")
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

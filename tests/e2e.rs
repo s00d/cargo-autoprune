@@ -381,11 +381,15 @@ fn cli_dry_run_and_prune() {
     assert_eq!(before, inventory(&ws.target), "dry run changed files");
     let st = run(&["autoprune", "status"]);
     assert!(
-        st.contains("reclaimable now") && st.contains("superseded"),
+        st.contains("reclaimable now")
+            && (st.contains("superseded") || st.contains("outdated dependency")),
         "{st}"
     );
     let real = run(&["autoprune"]);
-    assert!(real.contains("superseded"), "breakdown missing: {real}");
+    assert!(
+        real.contains("superseded") || real.contains("outdated dependency"),
+        "breakdown missing: {real}"
+    );
     assert!(real.contains("removed"), "{real}");
     assert_eq!(
         ws.deps_files("debug", "libdep_a-")
@@ -857,6 +861,47 @@ fn lockfile_change_supersedes_without_waiting_for_grace() {
     assert!(left.is_empty(), "{left:#?}");
 }
 
+#[test]
+fn revert_reuses_old_copies_and_the_dead_newer_ones_go() {
+    // bump and build, then revert: cargo reuses the older copies, which are now the live ones,
+    // while the newer copies are dead. Even after the grace period the live ones must stay.
+    let ws = Ws::new("revertlive");
+    let cfg = || Config {
+        lock_wait: Duration::from_secs(60),
+        ..Config::default()
+    };
+    ws.deps(&format!("{A10}\ndep_b = \"1\""));
+    ws.run_all(&CMDS[..2]);
+    std::thread::sleep(Duration::from_millis(1100));
+    ws.deps(&format!("{A11}\ndep_b = \"1\""));
+    ws.run_all(&CMDS[..2]); // no prune in between: the A10 copies stay
+    std::thread::sleep(Duration::from_millis(1100));
+    ws.deps(&format!("{A10}\ndep_b = \"1\""));
+    assert_eq!(
+        ws.run_all(&CMDS[..2]),
+        0,
+        "the revert reuses the old copies"
+    );
+    // an hour later: every copy is far older than the grace period (sources age too, or cargo
+    // would see them newer than their outputs and rebuild for that reason)
+    age_tree(&ws.root, 3600);
+    // ages also the lock file: put it back to "now" so it stays the newest change
+    let lock = ws.dir.join("Cargo.lock");
+    fs::write(&lock, fs::read(&lock).unwrap()).unwrap();
+    ws.prune_with(cfg());
+    assert_eq!(ws.run_all(&CMDS[..2]), 0, "live copies were deleted");
+    let rlibs: Vec<_> = ws
+        .deps_files("debug", "libdep_a-")
+        .into_iter()
+        .filter(|f| f.ends_with(".rlib"))
+        .collect();
+    assert_eq!(
+        rlibs.len(),
+        1,
+        "the dead dep_a 1.1 copy should go: {rlibs:?}"
+    );
+}
+
 fn host_triple() -> String {
     let out = Command::new("rustc").arg("-vV").output().unwrap();
     String::from_utf8_lossy(&out.stdout)
@@ -967,7 +1012,7 @@ fn server_mode_recursive_and_remove_idle() {
     assert!(!b.target.exists(), "idle target should be gone: {real}");
     assert!(a.target.exists());
     assert!(
-        real.contains("superseded"),
+        real.contains("superseded") || real.contains("outdated dependency"),
         "the active target is pruned as usual: {real}"
     );
     assert_eq!(a.cargo(CMDS[0]), 0);

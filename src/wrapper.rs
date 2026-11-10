@@ -239,6 +239,7 @@ fn maybe_trigger(profile: &Path) {
 }
 
 pub fn background(profile: Option<PathBuf>) {
+    close_inherited_fds();
     let Some(profile) = profile else { return };
     let state = profile.join(STATE_DIR);
     let notices = match prune(&profile, &Config::from_env()) {
@@ -254,6 +255,21 @@ pub fn background(profile: Option<PathBuf>) {
         add_notice(&state, &n);
     }
 }
+
+/// Drop every descriptor inherited from cargo/rustc above stderr (pipes a CI step or a test
+/// harness waits on, jobserver fds): the pruner must never keep someone else's pipe open.
+#[cfg(unix)]
+fn close_inherited_fds() {
+    extern "C" {
+        fn close(fd: i32) -> i32;
+    }
+    for fd in 3..1024 {
+        // SAFETY: nothing in this process has opened descriptors yet at this point
+        unsafe { close(fd) };
+    }
+}
+#[cfg(not(unix))]
+fn close_inherited_fds() {} // Windows: the spawn already made the std handles non-inheritable
 
 /// Print pending notices once on the terminal. Not on stderr: cargo stores a crate's stderr and
 /// replays it on every later build until the crate is recompiled.

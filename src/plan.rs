@@ -1,21 +1,19 @@
-//! Decide what is garbage in one Cargo profile dir (`target/debug`, `target/<triple>/release`, ...)
-//! and delete it while holding Cargo's own build locks.
+//! Decide what is garbage in one Cargo profile dir (`target/debug`, `target/<triple>/release`, ...).
 //!
-//! Model: every compiled unit has a 16-hex metadata hash `H` shared by
-//! `.fingerprint/<pkg>-H/`, `build/<pkg>-H/` and every `deps/*-H*` / `examples/*-H*` file.
-//! Units of the same package and the same *kind* (lib build vs `check` rmeta, test, bin,
-//! build-script compile/run) form a group. Inside a group the newest unit is live; units that are
-//! older than the newest by more than `grace` were superseded (dependency/feature/profile change)
-//! and are deleted. Units without a fingerprint can never be fresh for Cargo, so they are orphans.
-//! If a deleted unit comes back (two legit variants built alternately, e.g. `-p x --features y`),
-//! its group is pinned and no longer deduplicated.
+//! Model: every compiled unit has a 16-hex metadata hash `H` shared by `.fingerprint/<pkg>-H/`,
+//! `build/<pkg>-H/` and every `deps/*-H*` / `examples/*-H*` file.
 //!
-//! When the workspace `Cargo.lock` is next to `target/`, only workspace (path) packages are
-//! deduplicated; registry/git units stay only while reachable from a kept workspace unit through
-//! the `deps` edges of `.fingerprint/*/*.json` (each edge names the dependency's fingerprint value,
-//! the hex in the sibling file). That drops removed dependencies and deps of superseded units.
-//! The `rustc` hash in the json separates `clippy-driver` from `rustc` builds; a hash with no
-//! writes for `RUSTC_RETIRE` before the newest unit (old toolchain) is dropped entirely.
+//! - Units without a fingerprint can never be fresh for Cargo: orphans, deleted.
+//! - Workspace units (path packages from the `Cargo.lock` next to `target/`) are grouped by
+//!   package, target kind, outputs, fingerprint signature (features, profile, rustflags, ...),
+//!   rustc hash and clippy tag. Inside a group, units older than the newest by more than `grace`
+//!   were superseded and are deleted, unless the group is pinned (alternating variants, see
+//!   `prune`). Units whose crate root source is gone (removed/renamed target) are deleted.
+//! - Registry/git units stay only while reachable from a kept workspace unit (or from any unit of
+//!   a sibling profile dir) through the `deps` edges of `.fingerprint/*/*.json`; each edge names
+//!   the dependency's fingerprint value, the hex in the sibling file.
+//! - A rustc hash with no writes for `RUSTC_RETIRE` before the newest unit (old toolchain) goes.
+//! - Without a `Cargo.lock` every unit is grouped like a workspace unit.
 
 use crate::fingerprint::Workspace;
 use crate::fsutil::size_of;

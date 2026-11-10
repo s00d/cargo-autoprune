@@ -57,10 +57,11 @@ A *unit* is everything with one metadata hash `H`: `.fingerprint/<pkg>-H/`, `bui
 | What | Rule |
 |---|---|
 | Units with no fingerprint (orphans, e.g. `.o`/`.d` left after an executable was deleted) | Always. Cargo can never consider them fresh |
+| Units of removed or renamed targets (bin, test, example, build script) | The crate root named first in the unit's rustc dep-info file no longer exists. A build-script run goes with its compiled build script |
 | Superseded workspace units | Group by package + target kind (lib, test, bin, example, build-script compile/run) + outputs (`rlib` or `check` rmeta) + fingerprint json signature (features, profile, rustflags, config, target) + rustc hash + clippy tag. In each group, delete copies older than the newest by more than the grace period |
-| Registry/git units | Kept only while a kept workspace unit depends on them, transitively, through the `deps` edges in `.fingerprint/*/*.json`. Removed dependencies, old versions and old feature sets go automatically |
+| Registry/git units | Kept only while a kept workspace unit depends on them, transitively, through the `deps` edges in `.fingerprint/*/*.json`. Edges from the other profile dirs of the same target count too, because with `--target` the build scripts and proc-macros live in the host profile. Removed dependencies, old versions and old feature sets go automatically. A removed workspace member is no longer in `Cargo.lock`, so it is treated the same way |
 | Old toolchains | A rustc hash with no writes for 14 days before the newest unit is dropped |
-| `incremental/<crate>-<id>/` | Follows the workspace unit of the same crate with the closest mtime, and goes with it. Dirs of crates that no longer exist are deleted |
+| `incremental/<crate>-<id>/` | Follows its unit. The session's work products are hard links to the unit's `.rmeta` / `.rcgu.o` in `deps/`, so the inode identifies the owner. Without a shared inode (Linux deletes a binary's objects), units and dirs of the crate are paired one-to-one, closest mtime first. Dirs left without a unit are deleted |
 | Over `CARGO_AUTOPRUNE_MAX_SIZE` | The oldest remaining units go first |
 
 What it never touches: anything outside `target/<profile>/{deps,examples,.fingerprint,build,incremental}`,
@@ -75,12 +76,19 @@ never a broken build.
 - `cargo build -p x` and `cargo build --workspace` resolve features differently, so the same crate is
   built against different dependencies.
 
-For the second case, a deleted unit that gets rebuilt within 30 minutes is treated as a live variant.
-Its group is pinned, which stops deduplication for 24 hours. A revert done more than 30 minutes later
-is deduplicated as usual.
+For the second case only timing helps. The pruner remembers deletions for 24 hours. A deleted unit
+that gets rebuilt is a *comeback*:
 
-State lives in `<profile>/.autoprune/` (`stamp`, `log`, `pinned`, `deleted`, `tags/`). Each prune
-appends one line to `log`.
+- The first comeback in a group is treated as a revert (you tried a dependency and went back), so
+  the group stays deduplicated.
+- A second comeback in the same group within 24 hours means two variants alternate. The group is
+  pinned and not deduplicated for 24 hours.
+
+Alternating variants therefore cost one extra rebuild before the pin. Toggling a dependency back and
+forth twice looks the same as alternation and also pins.
+
+State lives in `<profile>/.autoprune/` (`stamp`, `log`, `deleted`, `suspects`, `pinned`, `tags/`).
+Each prune appends one line to `log`.
 
 **Locality** (workspace or registry) comes from the `Cargo.lock` next to `target/`. With a shared
 `CARGO_TARGET_DIR` there is no such file. Then every unit falls back to group deduplication, which
@@ -115,22 +123,22 @@ is one extra `exec` per compiled crate.
 
 ## Measurements (macOS, Apple Silicon, cargo 1.99)
 
-**Self-test** (`scripts/self-test.sh`): this crate's own `cargo test`, run four times with a version
-bump each time, which rehashes every unit:
+**Self-test** (`scripts/self-test.sh`): this crate's own `cargo test` (three test executables) is run
+four times with a version bump each time, which rehashes every unit.
 
 | Run | No wrapper | With cargo-autoprune |
 |---|---|---|
-| v0.1.1 | 18.2 MiB, 1 test exe | 18.2 MiB, 1 |
-| v0.1.2 | 36.5 MiB, 2 | 18.2 MiB, 1 (pruned 24.7 MiB in 25 ms) |
-| v0.1.3 | 54.7 MiB, 3 | 18.2 MiB, 1 |
-| v0.1.4 | 72.9 MiB, 4 | 18.2 MiB, 1 |
+| v0.1.1 | 64.6 MiB, 3 test exes | 64.6 MiB, 3 |
+| v0.1.2 | 126.8 MiB, 6 | 64.6 MiB, 3 (pruned 80.6 MiB in 170 ms) |
+| v0.1.3 | 189.1 MiB, 9 | 64.6 MiB, 3 |
+| v0.1.4 | 251.4 MiB, 12 | 64.6 MiB, 3 |
 
 A rebuild right after the last run: `Finished ... in 0.00s`. Nothing is recompiled, so the cache survives.
 
-**Churn test** (`scripts/churn-test.sh`): a 2-crate workspace with a build script, integration test,
-example, `--features` variant, `check`, `clippy` and `--release`. Each step changes the dependencies,
-then runs the whole command set with the wrapper. The result is compared with an *oracle*: the same
-commands in an empty target dir.
+**Churn test** (`scripts/churn-test.sh`) uses real crates.io crates: serde, libc, regex, tokio. The
+workspace has two crates, a build script, an integration test, an example, a `--features` variant,
+`check`, `clippy` and `--release`. Each step changes the dependencies, then runs the whole command set
+with the wrapper. The result is compared with an *oracle*: the same commands in an empty target dir.
 
 - `left`: files autoprune kept that the oracle doesn't have.
 - `lost`: files the oracle has that autoprune deleted.
@@ -147,23 +155,52 @@ commands in an empty target dir.
 | 7 tokio → 1.54.1, drop serde | 47.0 | 46.9 | 0 | 0 | 0 |
 | 8 edit app source | 47.9 | 47.0 | 0 | 0 | 0 |
 | 9 revert to step 1 (an hour later) | 90.2 | 90.1 | 0 | 0 | 0 |
-| 10 re-revert within 30 min | 131.4 | 47.0 | 168 | 0 | 0 |
+| 10 back to step 8 again | 131.4 | 47.0 | 168 | 0 | 0 |
 
-Step 10 is the pin rule at work: a unit that comes back within 30 minutes looks like a live variant,
-so that group keeps its copies for 24 hours. Without pruning, the same steps accumulate every copy.
-In the first version (no dependency graph), step 4 alone left 215 files.
+Step 10 is the second comeback, so those groups are pinned for 24 hours (see above). Without the
+pruner, every step keeps all of its copies.
 
-**Wrapper overhead**: 1000 calls of `cargo-autoprune <prog> --out-dir …` take 3.4 ms more per call
-than calling `<prog>` directly. That is one extra `exec`, while rustc itself takes 100 ms to minutes per
-crate. A prune of a small profile dir takes 4–50 ms.
+**Speed.** Wrapper overhead is 2.8 ms per compiled crate: 1000 calls take 5.3 s instead of 2.5 s.
+That is one extra `exec`, while rustc takes 100 ms to minutes per crate. A background prune scans a
+profile dir with 126,000 files (2,000 units) in 0.7 s warm and 1.8 s cold, and a small dir in
+5–50 ms. The prune runs after the build, while Cargo's lock is held for that short time.
 
 ## Tests
 
 ```bash
-cargo test                      # unit tests on temp dirs: grouping, graph, pins, incremental, cap, locks
+cargo test                      # 26 unit tests + 20 end-to-end tests with real cargo
 scripts/self-test.sh            # self-cleaning on this crate
-scripts/churn-test.sh           # dependency churn vs oracle (needs the pinned crates in ~/.cargo/registry)
+scripts/churn-test.sh           # real crates.io crates vs oracle (needs them in ~/.cargo/registry)
 ```
+
+The end-to-end suite (`tests/e2e.rs`, harness in `tests/support/`) needs no network. It builds a
+throwaway workspace against a vendored `directory` registry: two versions of a crate, a crate with a
+build script, a feature crate and a proc-macro. After every change it checks three things:
+
+- The pruned target equals a from-scratch oracle target.
+- A rerun compiles nothing.
+- A second prune finds nothing.
+
+Scenarios covered:
+
+- Version bump, quick revert, revert an hour later
+- Added and removed dependencies, a transitive bump through a build-script crate, a registry feature change
+- Workspace source edits
+- Feature variants of a member (`-p util --features extra`), and feature-unification alternation
+  (pinned after the second comeback, then nothing rebuilds)
+- `check` / `clippy` / `doc` / `bench` / `--release`
+- A custom profile, and an explicit `--target <host>` (cross-profile edges)
+- A `RUSTFLAGS` change
+- A removed workspace member and a renamed binary
+- A toolchain switch (another installed toolchain), and its retirement after 3 simulated weeks
+- Orphaned objects, the size cap, a shared target without `Cargo.lock`
+- The background prune waiting for a running build
+- The wrapper being transparent: version probes, chaining, compile errors
+- CLI `--dry-run`
+
+Source layout: `wrapper.rs` (hot path), `cli.rs`, `prune.rs` (one pass), `scan.rs` (units),
+`plan.rs` (rules), `fingerprint.rs` (json, dep-info, `Cargo.lock`), `state.rs`, `lock.rs`,
+`layout.rs`, `fsutil.rs`.
 
 ## Limitations
 

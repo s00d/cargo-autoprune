@@ -771,6 +771,67 @@ fn upgrade_from_the_legacy_layout() {
     assert_eq!(ws.cargo_in(CMDS[0], &ws.target.clone(), true, &env), 0);
 }
 
+#[test]
+fn build_script_outputs_of_each_feature_variant_are_kept() {
+    // two feature variants of a package with a build script: each lib has its own build-script
+    // run (OUT_DIR). The runs look alike (their json has no features), but both are live.
+    let ws = Ws::new("bsvariants");
+    ws.write("app/build.rs", "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); std::fs::write(std::path::Path::new(&std::env::var(\"OUT_DIR\").unwrap()).join(\"v.rs\"), \"pub const V: u32 = 1;\").unwrap(); }\n");
+    ws.write(
+        "app/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/v.rs\"));\npub fn app() -> u32 { util::u() + V }\n",
+    );
+    ws.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nextra = [\"dep_c\"]\n[dependencies]\nutil = { path = \"../util\" }\ndep_c = { version = \"1\", optional = true }\n",
+    );
+    let x = "build -p app --lib --features extra";
+    let plain = "build -p app --lib";
+    ws.cargo(x);
+    ws.cargo(plain);
+    ws.prune();
+    assert_eq!(
+        ws.cargo(x),
+        0,
+        "the extra variant lost its build-script output"
+    );
+    assert_eq!(ws.cargo(plain), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn background_prune_waits_until_cargo_test_has_run_the_tests() {
+    // cargo releases its lock after compiling and then runs the test binaries (and doctests),
+    // which still read artifacts: the pruner must start only after the whole command ended
+    let ws = Ws::new("testphase");
+    ws.deps(A10);
+    ws.cargo("test --no-run -p app");
+    ws.write("app/tests/it.rs", "#[test] fn it() { std::thread::sleep(std::time::Duration::from_secs(4)); assert!(app::app() > 0); }\n");
+    ws.deps(A11);
+    let env = [
+        ("CARGO_AUTOPRUNE", "1"),
+        ("CARGO_AUTOPRUNE_INTERVAL", "0"),
+        ("CARGO_AUTOPRUNE_GRACE", "0"),
+    ];
+    ws.cargo_in("test -p app", &ws.target.clone(), true, &env);
+    let ended = now_secs();
+    let log = ws.target.join("debug/.autoprune/log");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !log.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let line = fs::read_to_string(&log).unwrap_or_default();
+    let ts: u64 = line
+        .lines()
+        .last()
+        .and_then(|l| l.split(' ').next()?.parse().ok())
+        .expect("a prune ran");
+    assert!(
+        ts + 1 >= ended,
+        "pruned at {ts}, while cargo test ran until {ended}"
+    );
+}
+
 fn host_triple() -> String {
     let out = Command::new("rustc").arg("-vV").output().unwrap();
     String::from_utf8_lossy(&out.stdout)

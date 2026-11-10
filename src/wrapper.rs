@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const STAMP: &str = ".autoprune/stamp";
 const DEFAULT_INTERVAL: u64 = 300;
@@ -220,9 +220,13 @@ fn maybe_trigger(profile: &Path) {
     }
     let Ok(me) = env::current_exe() else { return };
     let mut cmd = Command::new(me);
-    cmd.arg("--background")
-        .arg(profile)
-        .stdin(Stdio::null())
+    cmd.arg("--background").arg(profile);
+    // cargo, our parent: it holds no lock while it runs test binaries and doctests, which still
+    // read the artifacts, so the pruner waits for the whole cargo command to end
+    if let Some(ppid) = parent_pid() {
+        cmd.arg("--after").arg(ppid.to_string());
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(unix)]
@@ -238,9 +242,12 @@ fn maybe_trigger(profile: &Path) {
     let _ = cmd.spawn(); // never fail the build because of us
 }
 
-pub fn background(profile: Option<PathBuf>) {
+pub fn background(profile: Option<PathBuf>, after: Option<u32>) {
     close_inherited_fds();
     let Some(profile) = profile else { return };
+    if let Some(pid) = after {
+        wait_for_exit(pid, Duration::from_secs(6 * 3600));
+    }
     let state = profile.join(STATE_DIR);
     let notices = match prune(&profile, &Config::from_env()) {
         Ok(Outcome::Done(r)) => notices_for(&profile, &r),
@@ -255,6 +262,34 @@ pub fn background(profile: Option<PathBuf>) {
         add_notice(&state, &n);
     }
 }
+
+#[cfg(unix)]
+extern "C" {
+    fn getppid() -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn parent_pid() -> Option<u32> {
+    // SAFETY: getppid has no preconditions
+    u32::try_from(unsafe { getppid() }).ok().filter(|&p| p > 1)
+}
+#[cfg(not(unix))]
+fn parent_pid() -> Option<u32> {
+    None // Windows: no cheap parent pid; the pruner relies on cargo's lock there
+}
+
+/// Poll until process `pid` is gone (signal 0 only checks existence).
+#[cfg(unix)]
+fn wait_for_exit(pid: u32, max: Duration) {
+    let deadline = std::time::Instant::now() + max;
+    // SAFETY: kill with signal 0 sends nothing
+    while unsafe { kill(pid as i32, 0) } == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+#[cfg(not(unix))]
+fn wait_for_exit(_: u32, _: Duration) {}
 
 /// Drop every descriptor inherited from cargo/rustc above stderr (pipes a CI step or a test
 /// harness waits on, jobserver fds): the pruner must never keep someone else's pipe open.

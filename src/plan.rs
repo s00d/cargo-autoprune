@@ -36,7 +36,6 @@ pub(crate) struct Candidate {
     /// old toolchain, size cap. Empty while kept.
     pub(crate) reason: &'static str,
     pub(crate) krate: Option<String>,
-    pub(crate) value: Option<u64>,
     pub(crate) id: String, // what goes into the `deleted` log: hash or `inc:<dir>`
     pub(crate) inodes: Vec<u64>,
     pub(crate) paths: Vec<PathBuf>,
@@ -101,14 +100,13 @@ pub(crate) fn plan(
         }
     }
 
-    type Member = (Candidate, Vec<u64>, bool, Option<PathBuf>);
+    type Member = (Candidate, Vec<u64>, Option<PathBuf>);
     let mut groups: HashMap<String, Vec<Member>> = HashMap::new();
     let mut registry: Vec<(Candidate, Option<u64>, Vec<u64>)> = Vec::new();
     for (h, u) in units {
         let local = ws.is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
         let c = Candidate {
             krate: if local { u.krate.clone() } else { None }, // only workspace crates are incremental
-            value: u.fp_value,
             id: h,
             inodes: u.inodes.clone(),
             paths: u.paths.clone(),
@@ -132,13 +130,14 @@ pub(crate) fn plan(
                 reason: "old toolchain",
                 ..c
             });
-        } else if local {
-            let is_run = u.fp_kind.iter().any(|k| k.starts_with("run-build-script"));
+        } else if local && !is_build_script(&u) {
             groups
                 .entry(u.group())
                 .or_default()
-                .push((c, u.dep_values, is_run, u.dep_info));
+                .push((c, u.dep_values, u.dep_info));
         } else {
+            // registry units and every build script (compile and run): their json carries no
+            // features, so feature variants look alike; they live while a kept unit uses them
             registry.push((c, u.fp_value, u.dep_values));
         }
     }
@@ -162,49 +161,36 @@ pub(crate) fn plan(
             (Some(n), Some(&f)) => n + VARIANT_TTL < f,
             _ => false,
         };
-        for (c, deps, is_run, dep_info) in members {
+        for (c, deps, dep_info) in members {
             let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n);
             if (stale || dead_variant) && !pinned.contains_key(&key) {
                 let reason = if stale { "superseded" } else { "stale variant" };
                 doomed.push(Candidate { reason, ..c });
             } else {
-                kept_local.push((c, deps, is_run, dep_info));
+                kept_local.push((c, deps, dep_info));
             }
         }
     }
     // Units of removed or renamed targets: their crate root source is gone. Only kept units need
     // the check (one dep-info read each), done on a few threads.
-    let checked = par_map(kept_local, |(c, deps, is_run, dep_info)| {
+    let checked = par_map(kept_local, |(c, deps, dep_info)| {
         let gone = matches!((ws, &dep_info), (Some(w), Some(d)) if w.target_removed(d));
-        (c, deps, is_run, gone)
+        (c, deps, gone)
     });
     let mut kept_local = Vec::new();
-    for (c, deps, is_run, gone) in checked {
+    for (c, deps, gone) in checked {
         if gone {
             doomed.push(Candidate {
                 reason: "removed target",
                 ..c
             });
         } else {
-            kept_local.push((c, deps, is_run));
+            kept_local.push((c, deps));
         }
     }
-    // A build-script run whose compiled build script is going away goes with it.
-    let doomed_vals: HashSet<u64> = doomed.iter().filter_map(|c| c.value).collect();
-    let kept_vals: HashSet<u64> = kept_local.iter().filter_map(|(c, _, _)| c.value).collect();
-    for (c, deps, is_run) in kept_local {
-        let orphan_run = is_run
-            && deps.iter().any(|v| doomed_vals.contains(v))
-            && !deps.iter().any(|v| kept_vals.contains(v));
-        if orphan_run {
-            doomed.push(Candidate {
-                reason: "removed target",
-                ..c
-            });
-        } else {
-            roots.extend(deps);
-            kept.push(c);
-        }
+    for (c, deps) in kept_local {
+        roots.extend(deps);
+        kept.push(c);
     }
 
     // Registry units live only while a kept unit depends on them (transitively).
@@ -310,7 +296,6 @@ pub(crate) fn plan(
     for ((dir, path, t, _), keep) in incremental.into_iter().zip(keep_dir) {
         let c = Candidate {
             krate: None,
-            value: None,
             inodes: Vec::new(),
             id: format!("inc:{dir}"),
             guard: Some(path.clone()),
@@ -328,6 +313,13 @@ pub(crate) fn plan(
     doomed.extend(inc_doomed);
     kept.extend(inc_kept);
     (doomed, kept)
+}
+
+/// Build-script compile or run unit (`build-script-build-script-build`, `run-build-script-...`).
+fn is_build_script(u: &Unit) -> bool {
+    u.fp_kind
+        .iter()
+        .any(|k| k.starts_with("build-script-") || k.starts_with("run-build-script"))
 }
 
 /// Over the cap: delete the oldest kept units (incremental first at equal age) until under it.

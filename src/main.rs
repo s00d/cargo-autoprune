@@ -7,7 +7,10 @@ fn main() {
     match args.first().and_then(|a| a.to_str()) {
         Some("autoprune") => cli::run(&args[1..]), // `cargo autoprune ...`
         Some("status") => cli::run(&args),
-        Some("--background") => wrapper::background(args.get(1).map(PathBuf::from)),
+        Some("--background") => wrapper::background(
+            args.get(1).map(PathBuf::from),
+            args.get(3).and_then(|p| p.to_str()?.parse().ok()),
+        ),
         None => cli::run(&[]),
         // `cargo-autoprune DIR ...`: cargo always passes a rustc path first, never a directory
         Some(a) if a.starts_with('-') || std::path::Path::new(a).is_dir() => cli::run(&args),

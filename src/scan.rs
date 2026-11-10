@@ -16,9 +16,10 @@ pub(crate) struct Unit {
     pub(crate) fp_kind: BTreeSet<String>,
     pub(crate) out_kind: BTreeSet<&'static str>,
     pub(crate) has_fingerprint: bool,
-    pub(crate) rustc: u64,  // hash of `rustc -vV` (differs between toolchains)
+    pub(crate) rustc: u64,   // hash of `rustc -vV` (differs between toolchains)
     pub(crate) sig: String, // fingerprint json minus deps/local/path: features, profile, rustflags, ...
     pub(crate) tag: String, // workspace wrapper that built it (clippy-driver), from TAGS_DIR
+    pub(crate) home: String, // workspace root recorded by the wrapper (shared target dirs)
     pub(crate) krate: Option<String>,
     pub(crate) dep_info: Option<PathBuf>, // rustc dep-info (`deps/<crate>-H.d`, build script's `.d`) // rustc crate name (stem of `deps/<crate>-H.d`), for incremental dirs
     pub(crate) fp_value: Option<u64>,     // this unit's fingerprint value
@@ -39,11 +40,12 @@ impl Unit {
         let fp: Vec<&str> = self.fp_kind.iter().map(String::as_str).collect();
         let out: Vec<&str> = self.out_kind.iter().copied().collect();
         format!(
-            "{name}|{}|{}|{}|{}|{}",
+            "{name}|{}|{}|{}|{}|{}|{}",
             fp.join(","),
             out.join(","),
             self.rustc,
             self.tag,
+            self.home,
             self.sig
         )
     }

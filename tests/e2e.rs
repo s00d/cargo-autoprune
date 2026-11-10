@@ -520,6 +520,103 @@ fn other_toolchain_rustc() -> Option<String> {
     None
 }
 
+#[test]
+fn separate_build_dir() {
+    // `build.build-dir`: intermediates live outside target/, profile dirs have only .cargo-build-lock
+    let ws = Ws::new("builddir");
+    let bd = ws.root.join("build-dir");
+    let bd_s = bd.display().to_string();
+    let env = [("CARGO_BUILD_BUILD_DIR", bd_s.as_str())];
+    let run = |deps: &str| -> usize {
+        ws.deps(deps);
+        CMDS.iter()
+            .map(|c| ws.cargo_in(c, &ws.target.clone(), true, &env))
+            .sum()
+    };
+    run(A10);
+    run(A11);
+    let profiles = cargo_autoprune::layout::profile_dirs(&bd);
+    assert!(
+        profiles.iter().any(|p| p.ends_with("debug")),
+        "{profiles:?}"
+    );
+    for p in &profiles {
+        cargo_autoprune::prune::prune(
+            p,
+            &Config {
+                grace: Duration::ZERO,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+    }
+    let rlibs: Vec<_> = fs::read_dir(bd.join("debug/deps"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("libdep_a-") && n.ends_with(".rlib"))
+        .collect();
+    assert_eq!(rlibs.len(), 1, "{rlibs:?}");
+    assert!(
+        bd.join("debug/.autoprune/units").exists(),
+        "wrapper should record workspace units"
+    );
+    for c in CMDS {
+        assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &env), 0);
+    }
+    // the background prune finds the build-dir profile through the wrapper too
+    ws.deps(A10);
+    let bg = [
+        env[0],
+        ("CARGO_AUTOPRUNE", "1"),
+        ("CARGO_AUTOPRUNE_INTERVAL", "0"),
+    ];
+    ws.cargo_in(CMDS[0], &ws.target.clone(), true, &bg);
+    assert!(bd.join("debug/.autoprune/stamp").exists());
+}
+
+#[test]
+fn two_workspaces_share_one_target_dir() {
+    // same package names (app, util) in both: they must not evict each other
+    let a = Ws::new("share-a");
+    let b = Ws::new("share-b");
+    let shared = a.root.join("shared-target");
+    let all = |ws: &Ws| -> usize {
+        CMDS.iter()
+            .map(|c| ws.cargo_in(c, &shared, true, &[]))
+            .sum()
+    };
+    let prune_all = || {
+        for p in cargo_autoprune::layout::profile_dirs(&shared) {
+            cargo_autoprune::prune::prune(
+                &p,
+                &Config {
+                    grace: Duration::ZERO,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+        }
+    };
+    a.deps(&format!("{A10}\ndep_b = \"1\""));
+    b.deps(A11);
+    all(&a);
+    all(&b);
+    prune_all();
+    assert_eq!(all(&a), 0, "workspace a lost units");
+    assert_eq!(all(&b), 0, "workspace b lost units");
+    a.deps(A10); // dep_b removed from a: no Cargo.lock next to the shared target, roots recorded
+    all(&a);
+    prune_all();
+    let left: Vec<String> = fs::read_dir(shared.join("debug/deps"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("libdep_b-"))
+        .collect();
+    assert!(left.is_empty(), "removed dependency kept: {left:?}");
+    assert_eq!(all(&a), 0);
+    assert_eq!(all(&b), 0);
+}
+
 fn host_triple() -> String {
     let out = Command::new("rustc").arg("-vV").output().unwrap();
     String::from_utf8_lossy(&out.stdout)

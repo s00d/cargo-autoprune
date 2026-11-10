@@ -42,9 +42,17 @@ pub(crate) fn out_kind(rest: &str, is_dir: bool) -> Option<&'static str> {
     })
 }
 
-/// A dir is a Cargo profile dir if it has `.cargo-lock` and sits under a `CACHEDIR.TAG` dir.
+/// Per-profile lock files. A separate `build.build-dir` has only `.cargo-build-lock`.
+pub(crate) fn has_cargo_lock(p: &Path) -> bool {
+    p.join(".cargo-lock").is_file() || p.join(".cargo-build-lock").is_file()
+}
+
+/// `<unit hash>\t<package dir>` lines appended by the wrapper for non-registry packages.
+pub const UNITS_FILE: &str = "units";
+
+/// A dir is a Cargo profile dir if it has a Cargo lock file and sits under a `CACHEDIR.TAG` dir.
 pub fn is_profile_dir(p: &Path) -> bool {
-    p.join(".cargo-lock").is_file()
+    has_cargo_lock(p)
         && p.ancestors()
             .skip(1)
             .take(3)

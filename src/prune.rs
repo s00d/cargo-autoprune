@@ -1,12 +1,13 @@
 //! One prune pass over a profile dir: lock, scan, plan, delete, record.
 
-use crate::fingerprint::{sibling_dep_values, workspace};
+use crate::fingerprint::{recorded_units, sibling_dep_values, workspace};
 use crate::fsutil::{par_map, size_of};
-use crate::layout::{is_profile_dir, STATE_DIR, TAGS_DIR};
+use crate::layout::{is_profile_dir, STATE_DIR, TAGS_DIR, UNITS_FILE};
 use crate::lock::{acquire_cargo_locks, lock_file};
 use crate::plan::{apply_cap, plan};
 use crate::scan::scan;
 use crate::state::{clean_tags, log, read_deleted, read_pins, write_deleted, write_pins};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -130,9 +131,14 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     let mut deleted_before = read_deleted(&state.join("deleted"), now);
     let mut pinned = read_pins(&state.join("pinned"), now);
     let mut suspects = read_pins(&state.join("suspects"), now);
-    let ws = workspace(profile);
+    let (ws, homes) = workspace(profile);
     ph.mark("state+workspace");
-    let (units, incremental) = scan(profile, ws.is_some(), &mut ph);
+    let (mut units, incremental) = scan(profile, ws.is_some(), &mut ph);
+    for (h, u) in units.iter_mut() {
+        if let Some(home) = homes.get(h) {
+            u.home = home.display().to_string();
+        }
+    }
 
     let mut report = Report::default();
     // A deleted unit was rebuilt. Once is a revert; a second comeback in the same group means two
@@ -211,6 +217,14 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
         clean_tags(&state.join(TAGS_DIR), profile);
         write_pins(&state.join("pinned"), &pinned)?;
         write_pins(&state.join("suspects"), &suspects)?;
+        // keep unit records only for units still there (no rustc runs while we hold the locks)
+        let gone: HashSet<&str> = doomed.iter().map(|c| c.id.as_str()).collect();
+        let records: String = recorded_units(profile)
+            .into_iter()
+            .filter(|(h, _)| !gone.contains(h.as_str()) && homes.contains_key(h))
+            .map(|(h, d)| format!("{h}\t{}\n", d.display()))
+            .collect();
+        let _ = crate::fsutil::atomic_write(&state.join(UNITS_FILE), &records);
         ph.mark("write state");
     }
     drop(cargo_locks);

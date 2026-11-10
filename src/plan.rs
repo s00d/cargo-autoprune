@@ -66,16 +66,15 @@ pub(crate) fn plan(
 
     // Build-script *run* units never reach rustc, so they inherit the clippy tag of the compiled
     // build script they depend on.
-    let tag_by_value: HashMap<u64, String> = units
+    let by_value: HashMap<u64, (String, String)> = units
         .values()
-        .filter(|u| !u.tag.is_empty())
-        .filter_map(|u| Some((u.fp_value?, u.tag.clone())))
+        .filter_map(|u| Some((u.fp_value?, (u.tag.clone(), u.home.clone()))))
         .collect();
     let mut units = units;
     for u in units.values_mut() {
-        if u.tag.is_empty() && u.fp_kind.iter().any(|k| k.starts_with("run-build-script")) {
-            if let Some(t) = u.dep_values.iter().find_map(|v| tag_by_value.get(v)) {
-                u.tag = t.clone();
+        if u.fp_kind.iter().any(|k| k.starts_with("run-build-script")) {
+            if let Some((tag, home)) = u.dep_values.iter().find_map(|v| by_value.get(v)) {
+                (u.tag, u.home) = (tag.clone(), home.clone());
             }
         }
     }

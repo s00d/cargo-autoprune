@@ -1,14 +1,15 @@
 //! Reading Cargo's `.fingerprint/*/*.json` and the workspace `Cargo.lock`.
 
 use crate::fsutil::read_dir;
-use crate::layout::profile_dirs;
-use std::collections::HashSet;
+use crate::layout::{profile_dirs, STATE_DIR, UNITS_FILE};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The workspace that owns a target dir: its root and its path (non-registry) packages.
 pub(crate) struct Workspace {
-    pub(crate) root: PathBuf,
+    /// Dirs holding a workspace `Cargo.lock` (several when a target dir is shared).
+    pub(crate) roots: Vec<PathBuf>,
     pub(crate) locals: HashSet<String>,
 }
 
@@ -18,15 +19,16 @@ impl Workspace {
     }
 
     /// The crate root source named first in a rustc dep-info file is gone: the target
-    /// (bin, test, example, build script) was removed or renamed.
+    /// (bin, test, example, build script) was removed or renamed. Relative paths are relative to
+    /// the workspace root cargo ran rustc in.
     pub(crate) fn target_removed(&self, dep_info: &Path) -> bool {
-        let Some(root) = fs::read_to_string(dep_info)
+        let Some(src) = fs::read_to_string(dep_info)
             .ok()
             .and_then(|t| first_dependency(&t))
         else {
             return false;
         };
-        !self.root.join(root).exists() // join keeps absolute paths as they are
+        !self.roots.iter().any(|r| r.join(&src).exists()) // join keeps absolute paths as they are
     }
 }
 
@@ -75,28 +77,68 @@ pub(crate) fn sibling_dep_values(profile: &Path) -> Vec<u64> {
     out
 }
 
-/// Package names without a `source` in the workspace `Cargo.lock` next to the target dir.
-pub(crate) fn workspace(profile: &Path) -> Option<Workspace> {
-    let target = profile
-        .ancestors()
-        .find(|a| a.join("CACHEDIR.TAG").is_file())?;
-    let root = target.parent()?;
-    let lock = fs::read_to_string(root.join("Cargo.lock")).ok()?;
-    let mut out = HashSet::new();
-    for pkg in lock.split("[[package]]").skip(1) {
-        let name = pkg
-            .lines()
-            .find_map(|l| l.strip_prefix("name = "))?
-            .trim()
-            .trim_matches('"');
-        if !pkg.lines().any(|l| l.starts_with("source = ")) {
-            out.insert(name.to_owned());
+/// Workspaces using this profile dir: the `Cargo.lock` next to the target dir, plus the
+/// workspaces of the package dirs the wrapper recorded. Path packages (no `source` in a lock) are
+/// local. Also returns each recorded unit's workspace root.
+pub(crate) fn workspace(profile: &Path) -> (Option<Workspace>, HashMap<String, PathBuf>) {
+    let mut lock_root: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+    let mut find = |dir: &Path| -> Option<PathBuf> {
+        lock_root
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                dir.ancestors()
+                    .find(|a| a.join("Cargo.lock").is_file())
+                    .map(Path::to_path_buf)
+            })
+            .clone()
+    };
+    let mut homes = HashMap::new();
+    for (h, dir) in recorded_units(profile) {
+        if let Some(r) = find(&dir) {
+            homes.insert(h, r);
         }
     }
-    (!out.is_empty()).then(|| Workspace {
-        root: root.to_path_buf(),
-        locals: out,
-    })
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(target) = profile
+        .ancestors()
+        .find(|a| a.join("CACHEDIR.TAG").is_file())
+    {
+        if let Some(p) = target.parent().filter(|p| p.join("Cargo.lock").is_file()) {
+            roots.push(p.to_path_buf());
+        }
+    }
+    for r in homes.values() {
+        if !roots.contains(r) {
+            roots.push(r.clone());
+        }
+    }
+    let mut locals = HashSet::new();
+    for r in &roots {
+        locals.extend(local_names(
+            &fs::read_to_string(r.join("Cargo.lock")).unwrap_or_default(),
+        ));
+    }
+    let ws = (!locals.is_empty()).then_some(Workspace { roots, locals });
+    (ws, homes)
+}
+
+/// `(unit hash, package dir)` pairs recorded by the wrapper; the last record of a hash wins.
+pub(crate) fn recorded_units(profile: &Path) -> HashMap<String, PathBuf> {
+    fs::read_to_string(profile.join(STATE_DIR).join(UNITS_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(h, d)| (h.to_owned(), PathBuf::from(d)))
+        .collect()
+}
+
+fn local_names(lock: &str) -> Vec<String> {
+    lock.split("[[package]]")
+        .skip(1)
+        .filter(|pkg| !pkg.lines().any(|l| l.starts_with("source = ")))
+        .filter_map(|pkg| pkg.lines().find_map(|l| l.strip_prefix("name = ")))
+        .map(|n| n.trim().trim_matches('"').to_owned())
+        .collect()
 }
 
 /// `rustc` hash and dependency fingerprint values from a fingerprint json:
@@ -124,16 +166,12 @@ pub(crate) fn parse_fingerprint_json(s: &str) -> (u64, Vec<u64>) {
     (rustc, deps)
 }
 
-/// What makes two builds of the same package legitimately different: everything in the json
-/// except `deps` and `local` (they embed the unit hash) and `path` (source path hash).
+/// What makes two builds of the same workspace package legitimately different: everything in the
+/// json except `deps` and `local` (they embed the unit hash). `path` (source path hash) keeps
+/// same-named packages of different workspaces sharing one target dir apart.
 pub(crate) fn json_signature(s: &str) -> String {
     let head = s.split("\"deps\":").next().unwrap_or("");
     let tail = s.split_once("\"rustflags\":").map_or("", |(_, t)| t);
-    let head: String = head
-        .split(',')
-        .filter(|f| !f.starts_with("\"path\":"))
-        .collect::<Vec<_>>()
-        .join(",");
     format!("{head}{tail}")
 }
 

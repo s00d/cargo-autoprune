@@ -1,6 +1,6 @@
 //! The `rustc-wrapper` hot path: tag clippy units, maybe spawn a background prune, exec rustc.
 
-use crate::layout::{STATE_DIR, TAGS_DIR};
+use crate::layout::{has_cargo_lock, STATE_DIR, TAGS_DIR, UNITS_FILE};
 use crate::prune::{env_secs, prune, Config};
 use std::env;
 use std::ffi::OsString;
@@ -14,7 +14,9 @@ const DEFAULT_INTERVAL: u64 = 300;
 
 pub fn run_wrapper(args: Vec<OsString>) -> ! {
     if let Some(profile) = out_dir(&args).as_deref().and_then(profile_of) {
-        tag_workspace_wrapper(&args, &profile); // needed even with the background prune off
+        // both are needed even with the background prune off
+        tag_workspace_wrapper(&args, &profile);
+        record_unit(&args, &profile);
         if env::var_os("CARGO_AUTOPRUNE").is_none_or(|v| v != "0") {
             maybe_trigger(&profile);
         }
@@ -67,12 +69,12 @@ fn out_dir(args: &[OsString]) -> Option<PathBuf> {
     None
 }
 
-/// The profile dir is the nearest ancestor of the out dir that holds `.cargo-lock`
+/// The profile dir is the nearest ancestor of the out dir that holds a Cargo lock file
 /// (`debug/deps`, `debug/build/x-<hash>`, `debug/examples`).
 fn profile_of(out: &Path) -> Option<PathBuf> {
     out.ancestors()
         .take(3)
-        .find(|a| a.join(".cargo-lock").is_file())
+        .find(|a| has_cargo_lock(a))
         .map(Path::to_path_buf)
 }
 
@@ -91,6 +93,35 @@ fn unit_hash(args: &[OsString]) -> Option<String> {
         }
     }
     None
+}
+
+/// Record which package dir a unit belongs to, so the pruner knows its workspace (`Cargo.lock`)
+/// even with a separate `build.build-dir` or a target dir shared by several workspaces, where
+/// same-named packages would otherwise look alike. One append per path-package compile.
+fn record_unit(args: &[OsString], profile: &Path) {
+    let Some(dir) = env::var_os("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let Some(dir) = dir.to_str() else { return };
+    if dir.contains("/registry/src/") || dir.contains("/git/checkouts/") {
+        return;
+    }
+    let Some(h) = unit_hash(args) else { return };
+    let file = profile.join(STATE_DIR).join(UNITS_FILE);
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)
+    };
+    let f = open().or_else(|_| {
+        let _ = std::fs::create_dir_all(profile.join(STATE_DIR));
+        open()
+    });
+    if let Ok(mut f) = f {
+        use std::io::Write;
+        let _ = f.write_all(format!("{h}\t{dir}\n").as_bytes()); // one O_APPEND write: no interleaving
+    }
 }
 
 /// clippy-driver (RUSTC_WORKSPACE_WRAPPER) units have the same fingerprint json as plain

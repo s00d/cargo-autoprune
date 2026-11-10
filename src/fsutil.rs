@@ -5,15 +5,66 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Inode number (unix); incremental work products are hard links to `deps/` files.
+/// A directory entry with what `readdir` already knows: no `stat` needed.
+pub(crate) struct Entry {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) is_dir: bool,
+    /// Inode (unix, from `d_ino`); incremental work products are hard links to `deps/` files.
+    pub(crate) ino: u64,
+}
+
+pub(crate) fn entries(p: &Path) -> Vec<Entry> {
+    let Ok(rd) = fs::read_dir(p) else {
+        return Vec::new();
+    };
+    rd.filter_map(|e| {
+        let e = e.ok()?;
+        Some(Entry {
+            is_dir: e.file_type().ok()?.is_dir(),
+            ino: ino(&e),
+            name: e.file_name().into_string().ok()?,
+            path: e.path(),
+        })
+    })
+    .collect()
+}
+
 #[cfg(unix)]
-pub(crate) fn inode(p: &Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    fs::symlink_metadata(p).ok().map(|m| m.ino())
+fn ino(e: &fs::DirEntry) -> u64 {
+    use std::os::unix::fs::DirEntryExt;
+    e.ino()
 }
 #[cfg(not(unix))]
-pub(crate) fn inode(_: &Path) -> Option<u64> {
-    None
+fn ino(_: &fs::DirEntry) -> u64 {
+    0
+}
+
+/// Map `f` over `items` on a few threads (the work is syscall-bound: open/read/readdir).
+pub(crate) fn par_map<T: Send, R: Send>(items: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8);
+    if items.len() < 64 || threads < 2 {
+        return items.into_iter().map(f).collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    let mut chunks: Vec<Vec<T>> = Vec::new();
+    let mut it = items.into_iter().peekable();
+    while it.peek().is_some() {
+        chunks.push(it.by_ref().take(chunk).collect());
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|c| s.spawn(move || c.into_iter().map(f).collect::<Vec<R>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
 }
 
 pub(crate) fn mtime(p: &Path) -> Option<SystemTime> {

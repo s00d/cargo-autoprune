@@ -8,7 +8,8 @@ fn main() {
         Some("autoprune") => cli::run(&args[1..]), // `cargo autoprune ...`
         Some("--background") => wrapper::background(args.get(1).map(PathBuf::from)),
         None => cli::run(&[]),
-        Some(a) if a.starts_with('-') => cli::run(&args),
+        // `cargo-autoprune DIR ...`: cargo always passes a rustc path first, never a directory
+        Some(a) if a.starts_with('-') || std::path::Path::new(a).is_dir() => cli::run(&args),
         _ => wrapper::run_wrapper(args),
     }
 }

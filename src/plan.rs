@@ -16,7 +16,7 @@
 //! - Without a `Cargo.lock` every unit is grouped like a workspace unit.
 
 use crate::fingerprint::Workspace;
-use crate::fsutil::size_of;
+use crate::fsutil::{par_map, size_of};
 use crate::prune::Config;
 use crate::scan::{Incremental, Unit};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -80,7 +80,8 @@ pub(crate) fn plan(
         }
     }
 
-    let mut groups: HashMap<String, Vec<(Candidate, Vec<u64>, bool)>> = HashMap::new();
+    type Member = (Candidate, Vec<u64>, bool, Option<PathBuf>);
+    let mut groups: HashMap<String, Vec<Member>> = HashMap::new();
     let mut registry: Vec<(Candidate, Option<u64>, Vec<u64>)> = Vec::new();
     for (h, u) in units {
         let local = ws.is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
@@ -93,18 +94,14 @@ pub(crate) fn plan(
             mtime: u.mtime,
             incremental: false,
         };
-        let removed = || match (ws, &u.dep_info) {
-            (Some(w), Some(d)) if local => w.target_removed(d),
-            _ => false,
-        };
-        if !u.has_fingerprint || retired(&u) || removed() {
+        if !u.has_fingerprint || retired(&u) {
             doomed.push(c); // no fingerprint: cargo rebuilds it anyway
         } else if local {
             let is_run = u.fp_kind.iter().any(|k| k.starts_with("run-build-script"));
             groups
                 .entry(u.group())
                 .or_default()
-                .push((c, u.dep_values, is_run));
+                .push((c, u.dep_values, is_run, u.dep_info));
         } else {
             registry.push((c, u.fp_value, u.dep_values));
         }
@@ -114,14 +111,28 @@ pub(crate) fn plan(
     let mut roots: Vec<u64> = extra_roots;
     let mut kept_local = Vec::new();
     for (key, members) in groups {
-        let newest = members.iter().filter_map(|(c, _, _)| c.mtime).max();
-        for (c, deps, is_run) in members {
+        let newest = members.iter().filter_map(|(c, ..)| c.mtime).max();
+        for (c, deps, is_run, dep_info) in members {
             let stale = matches!((newest, c.mtime), (Some(n), Some(t)) if t + cfg.grace < n);
             if stale && !pinned.contains_key(&key) {
                 doomed.push(c);
             } else {
-                kept_local.push((c, deps, is_run));
+                kept_local.push((c, deps, is_run, dep_info));
             }
+        }
+    }
+    // Units of removed or renamed targets: their crate root source is gone. Only kept units need
+    // the check (one dep-info read each), done on a few threads.
+    let checked = par_map(kept_local, |(c, deps, is_run, dep_info)| {
+        let gone = matches!((ws, &dep_info), (Some(w), Some(d)) if w.target_removed(d));
+        (c, deps, is_run, gone)
+    });
+    let mut kept_local = Vec::new();
+    for (c, deps, is_run, gone) in checked {
+        if gone {
+            doomed.push(c);
+        } else {
+            kept_local.push((c, deps, is_run));
         }
     }
     // A build-script run whose compiled build script is going away goes with it.

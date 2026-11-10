@@ -1,7 +1,7 @@
 //! One prune pass over a profile dir: lock, scan, plan, delete, record.
 
 use crate::fingerprint::{sibling_dep_values, workspace};
-use crate::fsutil::size_of;
+use crate::fsutil::{par_map, size_of};
 use crate::layout::{is_profile_dir, STATE_DIR, TAGS_DIR};
 use crate::lock::{acquire_cargo_locks, lock_file};
 use crate::plan::{apply_cap, plan};
@@ -37,6 +37,37 @@ impl Config {
     }
 }
 
+/// Phase timer: `mark(name)` records the time since the previous mark.
+pub(crate) struct Phases {
+    last: Instant,
+    pub(crate) list: Vec<(&'static str, Duration)>,
+}
+
+impl Phases {
+    pub(crate) fn new() -> Self {
+        Phases {
+            last: Instant::now(),
+            list: Vec::new(),
+        }
+    }
+    pub(crate) fn mark(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.list.push((name, now - self.last));
+        self.last = now;
+    }
+}
+
+fn remove_path(p: &Path) {
+    let r = match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(p),
+        Ok(_) => fs::remove_file(p),
+        Err(_) => return,
+    };
+    if let Err(e) = r {
+        eprintln!("cargo-autoprune: {}: {e}", p.display());
+    }
+}
+
 pub(crate) fn env_secs(name: &str, default: u64) -> Duration {
     let v = std::env::var(name).ok().and_then(|v| v.trim().parse().ok());
     Duration::from_secs(v.unwrap_or(default))
@@ -55,12 +86,16 @@ impl Default for Config {
 
 #[derive(Debug, Default)]
 pub struct Report {
+    /// Wall time of each phase, for `--verbose` / `CARGO_AUTOPRUNE_TRACE`.
+    pub phases: Vec<(&'static str, Duration)>,
     pub removed_units: usize,
     pub removed_incremental: usize,
     pub freed_bytes: u64,
     pub pinned_now: Vec<String>,
     pub removed: Vec<PathBuf>,
     pub elapsed: Duration,
+    /// Part of `elapsed` spent holding Cargo's locks (a cargo started meanwhile waits this long).
+    pub locked: Duration,
 }
 
 #[derive(Debug)]
@@ -83,17 +118,21 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
     if own.try_lock().is_err() {
         return Ok(Outcome::Busy);
     }
-    let Some(_cargo_locks) = acquire_cargo_locks(profile, cfg.lock_wait)? else {
+    let trash = state.join("trash");
+    let _ = fs::remove_dir_all(&trash); // left by an interrupted prune
+    let Some(cargo_locks) = acquire_cargo_locks(profile, cfg.lock_wait)? else {
         return Ok(Outcome::Busy);
     };
     let start = Instant::now(); // prune time only, not the wait for cargo
+    let mut ph = Phases::new();
 
     let now = SystemTime::now();
     let mut deleted_before = read_deleted(&state.join("deleted"), now);
     let mut pinned = read_pins(&state.join("pinned"), now);
     let mut suspects = read_pins(&state.join("suspects"), now);
     let ws = workspace(profile);
-    let (units, incremental) = scan(profile, ws.is_some());
+    ph.mark("state+workspace");
+    let (units, incremental) = scan(profile, ws.is_some(), &mut ph);
 
     let mut report = Report::default();
     // A deleted unit was rebuilt. Once is a revert; a second comeback in the same group means two
@@ -116,23 +155,41 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
         }
     }
     let extra_roots = sibling_dep_values(profile);
+    ph.mark("sibling roots");
     let (doomed, kept) = plan(units, incremental, &pinned, ws.as_ref(), extra_roots, cfg);
+    ph.mark("plan");
     let doomed = apply_cap(doomed, kept, cfg.max_size);
+    ph.mark("size cap");
 
+    // Under Cargo's locks: unlink doomed files, move doomed directories into the trash (one rename
+    // each). The directories' contents are deleted after the locks are released.
+    let mut moved = Vec::new();
+    let mut freed = 0u64;
     let mut new_deleted = Vec::new();
+    if !cfg.dry_run && !doomed.is_empty() {
+        fs::create_dir_all(&trash)?;
+    }
+    let mut files = Vec::new();
     for c in &doomed {
         for p in &c.paths {
-            report.freed_bytes += size_of(p);
-            if !cfg.dry_run {
-                let r = if fs::symlink_metadata(p).map(|m| m.is_dir()).unwrap_or(false) {
-                    fs::remove_dir_all(p)
-                } else {
-                    fs::remove_file(p)
-                };
-                if let Err(e) = r {
-                    if e.kind() != io::ErrorKind::NotFound {
-                        eprintln!("cargo-autoprune: {}: {e}", p.display());
+            if cfg.dry_run {
+                freed += size_of(p);
+            } else {
+                match fs::symlink_metadata(p) {
+                    // a directory goes with one rename; its files are deleted after unlocking
+                    Ok(m) if m.is_dir() => {
+                        let dst = trash.join(moved.len().to_string());
+                        match fs::rename(p, &dst) {
+                            Ok(()) => moved.push(dst),
+                            Err(_) => remove_path(p),
+                        }
                     }
+                    // a plain file: unlink touches one directory, a rename would touch two
+                    Ok(m) => {
+                        freed += m.len();
+                        files.push(p.clone());
+                    }
+                    Err(_) => {}
                 }
             }
             report.removed.push(p.clone());
@@ -144,7 +201,8 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
         }
         new_deleted.push(c.id.clone());
     }
-    report.elapsed = start.elapsed();
+    par_map(files, |p| remove_path(&p));
+    ph.mark("delete (locked)");
     if !cfg.dry_run {
         let mut deleted = deleted_before;
         let ts = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -153,8 +211,20 @@ pub fn prune(profile: &Path, cfg: &Config) -> io::Result<Outcome> {
         clean_tags(&state.join(TAGS_DIR), profile);
         write_pins(&state.join("pinned"), &pinned)?;
         write_pins(&state.join("suspects"), &suspects)?;
+        ph.mark("write state");
+    }
+    drop(cargo_locks);
+    report.locked = start.elapsed();
+    report.freed_bytes = freed + moved.iter().map(|p| size_of(p)).sum::<u64>();
+    if !cfg.dry_run {
+        remove_path(&trash);
+    }
+    ph.mark("delete dirs (unlocked)");
+    report.elapsed = start.elapsed();
+    if !cfg.dry_run {
         log(&state.join("log"), &report);
     }
+    report.phases = ph.list;
     Ok(Outcome::Done(report))
 }
 

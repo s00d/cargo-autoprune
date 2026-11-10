@@ -75,13 +75,18 @@ pub fn run(args: &[OsString]) {
     for p in profiles {
         match prune(&p, &cfg) {
             Ok(Outcome::Done(r)) => {
+                if verbose || env::var_os("CARGO_AUTOPRUNE_TRACE").is_some() {
+                    for (name, d) in &r.phases {
+                        println!("  {:>8.1} ms  {name}", d.as_secs_f64() * 1000.0);
+                    }
+                }
                 if verbose || cfg.dry_run {
                     for f in &r.removed {
                         println!("  {}", f.display());
                     }
                 }
                 println!(
-                    "{}: {} {} units, {} incremental dirs, {} ({} ms){}",
+                    "{}: {} {} units, {} incremental dirs, {} ({} ms, cargo blocked {} ms){}",
                     p.display(),
                     if cfg.dry_run {
                         "would remove"
@@ -92,6 +97,7 @@ pub fn run(args: &[OsString]) {
                     r.removed_incremental,
                     human(r.freed_bytes),
                     r.elapsed.as_millis(),
+                    r.locked.as_millis(),
                     if r.pinned_now.is_empty() {
                         String::new()
                     } else {

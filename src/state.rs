@@ -87,12 +87,13 @@ pub(crate) fn log(p: &Path, r: &Report) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
         let _ = writeln!(
             f,
-            "{ts} units={} incremental={} freed={} pinned={} took={}ms",
+            "{ts} units={} incremental={} freed={} pinned={} took={}ms locked={}ms",
             r.removed_units,
             r.removed_incremental,
             human(r.freed_bytes),
             r.pinned_now.len(),
-            r.elapsed.as_millis()
+            r.elapsed.as_millis(),
+            r.locked.as_millis()
         );
     }
 }

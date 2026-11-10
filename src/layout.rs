@@ -1,7 +1,6 @@
 //! Cargo target-dir layout: profile dirs and unit hashes in file names.
 
 use crate::fsutil::read_dir;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Per-profile state of cargo-autoprune: `<profile>/.autoprune/`.
@@ -29,29 +28,18 @@ pub fn split_hash(name: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
-/// Kind of an output file in `deps/` from the part after the hash.
-pub(crate) fn out_kind(rest: &str, path: &Path) -> Option<&'static str> {
+/// Kind of an output file in `deps/` from the part after the hash. Cargo's only extensionless
+/// outputs are executables, so no permission check (and no `stat`) is needed.
+pub(crate) fn out_kind(rest: &str, is_dir: bool) -> Option<&'static str> {
     Some(match rest {
+        _ if is_dir => return None, // .dSYM
         ".rlib" => "rlib",
         ".rmeta" => "rmeta",
         ".dylib" | ".so" | ".dll" => "dylib",
         ".a" | ".lib" => "staticlib",
-        ".exe" | ".wasm" => "bin",
-        "" if is_executable(path) => "bin",
-        _ => return None, // .d, .o, .dSYM, .pdb, ...
+        ".exe" | ".wasm" | "" => "bin",
+        _ => return None, // .d, .o, .pdb, ...
     })
-}
-
-#[cfg(unix)]
-pub(crate) fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    fs::symlink_metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o100 != 0)
-        .unwrap_or(false)
-}
-#[cfg(not(unix))]
-pub(crate) fn is_executable(p: &Path) -> bool {
-    p.is_file()
 }
 
 /// A dir is a Cargo profile dir if it has `.cargo-lock` and sits under a `CACHEDIR.TAG` dir.

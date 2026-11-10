@@ -1,9 +1,10 @@
 //! Collect units (everything sharing one metadata hash) and incremental dirs of a profile.
 
 use crate::fingerprint::{json_signature, parse_fingerprint_json, parse_le_hex};
-use crate::fsutil::{inode, mtime, read_dir};
+use crate::fsutil::{entries, mtime, par_map};
 use crate::layout::{out_kind, split_hash, STATE_DIR, TAGS_DIR};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::prune::Phases;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -51,89 +52,111 @@ impl Unit {
 /// `incremental/<crate>-<id>` dirs: name, path, mtime, inodes of their session files.
 pub(crate) type Incremental = Vec<(String, PathBuf, Option<SystemTime>, Vec<u64>)>;
 
-pub(crate) fn scan(profile: &Path, with_sig: bool) -> (BTreeMap<String, Unit>, Incremental) {
+pub(crate) fn scan(
+    profile: &Path,
+    with_sig: bool,
+    ph: &mut Phases,
+) -> (BTreeMap<String, Unit>, Incremental) {
     let mut units: BTreeMap<String, Unit> = BTreeMap::new();
-    let tags = profile.join(STATE_DIR).join(TAGS_DIR);
-    for (name, path) in read_dir(&profile.join(".fingerprint")) {
-        let Some((pkg, h, "")) = split_hash(&name) else {
-            continue;
+    // clippy tags: one listing instead of a failed open per unit
+    let tags: HashMap<String, String> = entries(&profile.join(STATE_DIR).join(TAGS_DIR))
+        .into_iter()
+        .map(|e| (e.name, fs::read_to_string(e.path).unwrap_or_default()))
+        .collect();
+    let fingerprints = par_map(entries(&profile.join(".fingerprint")), |e| {
+        let (pkg, h, "") = split_hash(&e.name)? else {
+            return None;
         };
-        let u = units.entry(h.to_owned()).or_default();
-        u.name = Some(pkg.to_owned());
-        u.has_fingerprint = true;
+        let mut u = Unit {
+            name: Some(pkg.to_owned()),
+            has_fingerprint: true,
+            ..Unit::default()
+        };
         // file names encode the target kind: lib-x, test-lib-x, bin-x, build-script-..., run-build-script-...
-        u.fp_kind = read_dir(&path)
-            .into_iter()
-            .map(|(n, _)| n)
+        let files = entries(&e.path);
+        u.fp_kind = files
+            .iter()
+            .map(|f| f.name.clone())
             .filter(|n| n != "invoked.timestamp" && !n.starts_with("output-"))
             .collect();
         if let Some(json) = u.fp_kind.iter().find(|n| n.ends_with(".json")).cloned() {
-            let text = fs::read_to_string(path.join(&json)).unwrap_or_default();
+            let text = fs::read_to_string(e.path.join(&json)).unwrap_or_default();
             (u.rustc, u.dep_values) = parse_fingerprint_json(&text);
             if with_sig {
                 u.sig = json_signature(&text);
             }
-            u.fp_value = fs::read_to_string(path.join(json.trim_end_matches(".json")))
+            u.fp_value = fs::read_to_string(e.path.join(json.trim_end_matches(".json")))
                 .ok()
                 .and_then(|h| parse_le_hex(h.trim()));
         }
-        u.tag = fs::read_to_string(tags.join(h)).unwrap_or_default();
-        u.touch(mtime(&path));
-        u.touch(mtime(&path.join("invoked.timestamp")));
-        u.paths.push(path);
-    }
-    for (name, path) in read_dir(&profile.join("build")) {
-        let Some((pkg, h, "")) = split_hash(&name) else {
+        u.tag = tags.get(h).cloned().unwrap_or_default();
+        // cargo writes invoked.timestamp every time it builds the unit
+        let stamp = files.iter().find(|f| f.name == "invoked.timestamp");
+        u.mtime = mtime(stamp.map_or(&e.path, |f| &f.path));
+        let h = h.to_owned();
+        u.paths.push(e.path);
+        Some((h, u))
+    });
+    units.extend(fingerprints.into_iter().flatten());
+    ph.mark("scan .fingerprint");
+    for e in entries(&profile.join("build")) {
+        let Some((pkg, h, "")) = split_hash(&e.name) else {
             continue;
         };
         let u = units.entry(h.to_owned()).or_default();
         if u.stem.is_empty() {
             u.stem = pkg.to_owned();
         }
-        if path.join("build-script-build").exists() {
+        let script = e.path.join(format!("build_script_build-{h}.d"));
+        if script.exists() {
             u.krate = Some("build_script_build".to_owned());
-            u.dep_info = Some(path.join(format!("build_script_build-{h}.d")));
+            u.dep_info = Some(script);
         }
-        u.touch(mtime(&path));
-        u.paths.push(path);
+        if !u.has_fingerprint {
+            u.touch(mtime(&e.path));
+        }
+        u.paths.push(e.path);
     }
+    ph.mark("scan build");
+    // deps/ holds most files (objects, dep-info): names and inodes only, no stat per file
     for area in ["deps", "examples"] {
-        for (name, path) in read_dir(&profile.join(area)) {
-            let Some((stem, h, rest)) = split_hash(&name) else {
+        for e in entries(&profile.join(area)) {
+            let Some((stem, h, rest)) = split_hash(&e.name) else {
                 continue;
             };
             let u = units.entry(h.to_owned()).or_default();
             if u.stem.is_empty() {
                 u.stem = stem.to_owned();
             }
-            if let Some(k) = out_kind(rest, &path) {
+            if let Some(k) = out_kind(rest, e.is_dir) {
                 u.out_kind.insert(k);
             }
             if rest == ".rmeta" || rest.ends_with(".rcgu.o") {
-                u.inodes.extend(inode(&path));
+                u.inodes.push(e.ino);
             }
             if rest == ".d" {
                 u.krate = Some(stem.to_owned());
-                u.dep_info = Some(path.clone());
+                u.dep_info = Some(e.path.clone());
             }
-            u.touch(mtime(&path));
-            u.paths.push(path);
+            u.paths.push(e.path);
         }
     }
-    let incremental = read_dir(&profile.join("incremental"))
+    ph.mark("scan deps");
+    let dirs: Vec<_> = entries(&profile.join("incremental"))
         .into_iter()
-        .filter(|(n, p)| n.contains('-') && p.is_dir())
-        .map(|(n, p)| {
-            let t = mtime(&p);
-            let inodes = read_dir(&p)
-                .into_iter()
-                .filter(|(s, q)| s.starts_with("s-") && q.is_dir())
-                .flat_map(|(_, q)| read_dir(&q))
-                .filter(|(f, _)| f.ends_with(".o") || f == "metadata.rmeta")
-                .filter_map(|(_, f)| inode(&f))
-                .collect();
-            (n, p, t, inodes)
-        })
+        .filter(|e| e.is_dir && e.name.contains('-'))
         .collect();
+    let incremental = par_map(dirs, |e| {
+        let inodes = entries(&e.path)
+            .into_iter()
+            .filter(|s| s.is_dir && s.name.starts_with("s-"))
+            .flat_map(|s| entries(&s.path))
+            .filter(|f| f.name.ends_with(".o") || f.name == "metadata.rmeta")
+            .map(|f| f.ino)
+            .collect();
+        let t = mtime(&e.path);
+        (e.name, e.path, t, inodes)
+    });
+    ph.mark("scan incremental");
     (units, incremental)
 }

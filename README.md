@@ -290,6 +290,21 @@ with the wrapper. The result is compared with an *oracle*: the same commands in 
 Step 10 is the second comeback, so those groups are pinned for 24 hours (see above). Without the
 pruner, every step keeps all of its copies.
 
+**Live: a 22-crate Tauri + Rust workspace** with 1,150 tests and a 12.4 GB target. Each step ran
+`cargo test --workspace` through the wrapper, with the background prune (default settings) after
+it:
+
+| Step | Recompiled | Tests | target after the prune |
+|---|---|---|---|
+| start | – | – | 12.44 GB |
+| repeat run | 23 | 1,150 passed | 14.15 GB |
+| `memchr` + `itoa` bumped in `Cargo.lock` | 121 | 1,150 passed | 13.08 GB (6.0 GiB freed) |
+| bump reverted | 68 | 1,150 passed | 12.67 GB (4.8 GiB freed automatically; cargo waited 0.34 s) |
+| no-op | 0 | – | 12.8 GB |
+
+The target stays at its size while dependencies keep changing. Without the pruner it would have
+grown by about 5 GB per step.
+
 **Speed.**
 
 - **Wrapper.** 2.8 ms per compiled crate, the same as a minimal C `execv` wrapper (4.7–5.5 ms per

@@ -32,11 +32,6 @@ pub(crate) struct Unit {
 }
 
 impl Unit {
-    pub(crate) fn touch(&mut self, t: Option<SystemTime>) {
-        if t > self.mtime {
-            self.mtime = t;
-        }
-    }
     pub(crate) fn group(&self) -> String {
         let name = self.name.as_deref().unwrap_or(&self.stem);
         let fp: Vec<&str> = self.fp_kind.iter().map(String::as_str).collect();
@@ -153,7 +148,7 @@ pub(crate) fn scan(
             u.dep_info = Some(script);
         }
         if !u.has_fingerprint {
-            u.touch(mtime(&e.path));
+            u.mtime = u.mtime.max(mtime(&e.path));
         }
         u.paths.push(e.path);
     }

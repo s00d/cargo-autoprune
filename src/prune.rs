@@ -31,12 +31,14 @@ pub struct Config {
 impl Config {
     /// Defaults overridden by `CARGO_AUTOPRUNE_GRACE` / `CARGO_AUTOPRUNE_MAX_SIZE`.
     pub fn from_env() -> Self {
+        Self::from_vars(|k| std::env::var(k).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
         let d = Config::default();
         Config {
-            grace: env_secs("CARGO_AUTOPRUNE_GRACE", d.grace.as_secs()),
-            max_size: std::env::var("CARGO_AUTOPRUNE_MAX_SIZE")
-                .ok()
-                .and_then(|s| crate::cli::parse_cap(&s).ok()),
+            grace: secs(var("CARGO_AUTOPRUNE_GRACE"), d.grace.as_secs()),
+            max_size: var("CARGO_AUTOPRUNE_MAX_SIZE").and_then(|s| crate::cli::parse_cap(&s).ok()),
             ..d
         }
     }
@@ -87,8 +89,11 @@ fn remove_path(p: &Path) -> Option<String> {
 }
 
 pub(crate) fn env_secs(name: &str, default: u64) -> Duration {
-    let v = std::env::var(name).ok().and_then(|v| v.trim().parse().ok());
-    Duration::from_secs(v.unwrap_or(default))
+    secs(std::env::var(name).ok(), default)
+}
+
+fn secs(v: Option<String>, default: u64) -> Duration {
+    Duration::from_secs(v.and_then(|v| v.trim().parse().ok()).unwrap_or(default))
 }
 
 impl Default for Config {
@@ -640,6 +645,529 @@ mod tests {
         assert!(fx.exists(&format!("deps/libserde-{A}.rlib")));
         drop(held);
         assert_eq!(fx.run(&cfg()).removed_units, 1);
+    }
+
+    fn hx(n: u64) -> String {
+        format!("{n:016x}")
+    }
+    fn reasons(r: &Report) -> Vec<(&'static str, usize)> {
+        r.by_reason.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+    fn set_time(p: &Path, t: SystemTime) {
+        fs::File::options()
+            .read(true)
+            .open(p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+    const DAY: u64 = 24 * 3600;
+    const LIB: &str = r#"{"rustc":1,"features":"[]","deps":[],"local":[]}"#;
+
+    #[test]
+    fn config_from_vars() {
+        let c = Config::from_vars(|k| match k {
+            "CARGO_AUTOPRUNE_GRACE" => Some(" 30 ".into()),
+            "CARGO_AUTOPRUNE_MAX_SIZE" => Some("2G".into()),
+            _ => None,
+        });
+        assert_eq!(
+            (c.grace, c.max_size),
+            (Duration::from_secs(30), Some(2 << 30))
+        );
+        let c = Config::from_vars(|_| Some("junk".into()));
+        assert_eq!((c.grace, c.max_size), (Duration::from_secs(600), None));
+        // cargo sets the package version for test processes: 0.1.x
+        assert_eq!(
+            env_secs("CARGO_PKG_VERSION_MINOR", 99),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            env_secs("CARGO_AUTOPRUNE_NEVER_SET_IN_TESTS", 7),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn freed_bytes_trash_log_and_phases() {
+        let fx = Fx::new("freed");
+        fx.lib("serde", A, 7200, false);
+        fx.lib("serde", B, 10, false);
+        let state = fx.prof.join(STATE_DIR);
+        // fingerprint dir (3 files, moved to the trash) + rlib, .o, .rmeta, .d: 1000 B each
+        let dry = fx.run(&Config {
+            dry_run: true,
+            ..cfg()
+        });
+        assert_eq!((dry.freed_bytes, dry.removed.len()), (7000, 5));
+        assert!(!state.join("log").exists() && !state.join("trash").exists());
+        let r = fx.run(&cfg());
+        assert_eq!((r.freed_bytes, r.removed.len()), (7000, 5));
+        assert_eq!(reasons(&r), [("superseded", 1)]);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(!state.join("trash").exists());
+        assert!(fs::read_to_string(state.join("log"))
+            .unwrap()
+            .contains("units=1 "));
+        let phases: Vec<&str> = r.phases.iter().map(|p| p.0).collect();
+        assert!(
+            phases.contains(&"plan") && phases.contains(&"delete (locked)"),
+            "{phases:?}"
+        );
+    }
+
+    /// Deletes `n` superseded units while a "cargo" thread takes the lock whenever it is free
+    /// and rebuilds (touches) every superseded unit. Returns how many units were deleted.
+    fn prune_racing_cargo(tag: &str, lock_batch: Duration) -> usize {
+        let fx = Fx::new(tag);
+        let n = 20;
+        for i in 0..n {
+            fx.lib(&format!("p{i}"), &hx(i), 7200, false);
+            fx.lib(&format!("p{i}"), &hx(100 + i), 10, false);
+        }
+        let prof = fx.prof.clone();
+        let r = std::thread::scope(|s| {
+            s.spawn(|| {
+                let trash = prof.join(STATE_DIR).join("trash");
+                let start = Instant::now();
+                while !trash.exists() && start.elapsed() < Duration::from_secs(20) {
+                    std::thread::yield_now();
+                }
+                let lock = lock_file(&prof.join(".cargo-lock")).unwrap();
+                while lock.try_lock().is_err() && start.elapsed() < Duration::from_secs(20) {
+                    std::thread::yield_now();
+                }
+                for i in 0..n {
+                    let stamp = prof.join(format!(".fingerprint/p{i}-{}/invoked.timestamp", hx(i)));
+                    if stamp.exists() {
+                        set_age(&stamp, 0);
+                    }
+                }
+            });
+            fx.run(&Config {
+                lock_batch,
+                lock_wait: Duration::from_secs(20),
+                ..cfg()
+            })
+        });
+        for i in 0..n {
+            let fp = fx.exists(&format!(".fingerprint/p{i}-{}", hx(i)));
+            let lib = fx.exists(&format!("deps/libp{i}-{}.rlib", hx(i)));
+            assert_eq!(fp, lib, "unit {i} half deleted");
+        }
+        r.removed_units
+    }
+
+    #[test]
+    fn relocks_between_batches_and_skips_units_cargo_touched() {
+        assert!(prune_racing_cargo("race0", Duration::ZERO) < 20);
+        assert_eq!(prune_racing_cargo("race1", Duration::from_secs(60)), 20);
+    }
+
+    #[test]
+    fn units_file_keeps_live_records_only() {
+        let fx = Fx::new("records");
+        fx.lockfile(&["app"], &[]);
+        fx.lib("app", A, 7200, false);
+        fx.lib("app", B, 10, false);
+        let state = fx.prof.join(STATE_DIR);
+        fs::create_dir_all(&state).unwrap();
+        let root = fx.root.display();
+        fs::write(
+            state.join(UNITS_FILE),
+            format!("{A}\t{root}\n{B}\t{root}\n{C}\t/nonexistent-autoprune/x\n"),
+        )
+        .unwrap();
+        assert_eq!(fx.run(&cfg()).removed_units, 1);
+        assert_eq!(
+            fs::read_to_string(state.join(UNITS_FILE)).unwrap(),
+            format!("{B}\t{root}\n")
+        );
+    }
+
+    #[test]
+    fn every_reason_is_reported() {
+        let fx = Fx::new("reasons");
+        fx.lockfile(&["app", "util"], &["serde"]);
+        fx.file(&format!("deps/x-{}.d", hx(1)), 10); // orphan
+        fx.node("app", A, 7200, 1, 100, &[]); // superseded by B
+        fx.node("app", B, 10, 1, 101, &[]);
+        fx.node("util", C, 15 * DAY, 9, 102, &[]); // old toolchain
+        fx.node("serde", &hx(2), 7200, 1, 103, &[]); // nobody uses it
+        let r = fx.run(&cfg());
+        assert_eq!(
+            reasons(&r),
+            [
+                ("old toolchain", 1),
+                ("orphan", 1),
+                ("superseded", 1),
+                ("unreachable", 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn toolchain_retires_after_two_weeks() {
+        let fx = Fx::new("retire");
+        fx.node("util", A, 13 * DAY, 9, 1, &[]);
+        fx.node("app", B, 10, 1, 2, &[]);
+        assert_eq!(fx.run(&cfg()).removed_units, 0);
+    }
+
+    #[test]
+    fn legacy_layout_retires_a_day_after_the_new_one() {
+        let run = |legacy_age: u64, with_new: bool| {
+            let fx = Fx::new(&format!("legacy{legacy_age}{with_new}"));
+            fx.lib("old", A, legacy_age, false);
+            if with_new {
+                fx.new_unit("new", B, 10, &["libnew.rlib"]);
+            }
+            let r = fx.run(&cfg());
+            assert!(!with_new || fx.exists(&format!("build/new/{B}/out/libnew.rlib")));
+            reasons(&r)
+        };
+        assert_eq!(run(23 * 3600, true), []);
+        assert_eq!(run(25 * 3600, true), [("old layout", 1)]);
+        assert_eq!(
+            run(30 * DAY, false),
+            [],
+            "no new layout: nothing to compare with"
+        );
+    }
+
+    #[test]
+    fn stale_variant_expires_after_a_week() {
+        let run = |age: u64| {
+            let fx = Fx::new(&format!("variant{age}"));
+            fx.lockfile(&["util"], &[]); // signatures need a workspace
+            fx.unit_json("util", A, age, "lib-util", LIB, 1);
+            let x = LIB.replace(r#""[]""#, r#""[\"x\"]""#);
+            fx.unit_json("util", B, 10, "lib-util", &x, 2);
+            reasons(&fx.run(&cfg()))
+        };
+        assert_eq!(run(6 * DAY), []);
+        assert_eq!(run(8 * DAY), [("stale variant", 1)]);
+    }
+
+    #[test]
+    fn lock_change_supersedes_within_grace() {
+        let run = |old: u64, registry: u64| {
+            let fx = Fx::new(&format!("lockchg{old}-{registry}"));
+            fx.lockfile(&["app"], &["dep"]);
+            set_age(&fx.root.join("Cargo.lock"), 100);
+            fx.node("app", A, old, 1, 1, &[]);
+            fx.node("app", B, 10, 1, 2, &[]);
+            fx.node("dep", C, registry, 1, 3, &[]); // unused, within the grace period
+            reasons(&fx.run(&cfg()))
+        };
+        assert_eq!(run(200, 200), [("superseded", 1), ("unreachable", 1)]);
+        assert_eq!(run(50, 50), []);
+    }
+
+    #[test]
+    fn outdated_registry_version_and_its_dependents_go() {
+        let fx = Fx::new("outdated");
+        fx.lockfile(&["app"], &["serde", "regex"]);
+        let src = |p: &str, v: &str| format!("x.d: /h/registry/src/idx/{p}-{v}/src/lib.rs\n");
+        fx.node("serde", B, 7200, 1, 1, &[]);
+        fs::write(
+            fx.file(&format!("deps/serde-{B}.d"), 7200),
+            src("serde", "0.9.0"),
+        )
+        .unwrap();
+        fx.node("regex", C, 7200, 1, 2, &[]);
+        fs::write(
+            fx.file(&format!("deps/regex-{C}.d"), 7200),
+            src("regex", "1.0.0"),
+        )
+        .unwrap();
+        fx.node("app", A, 10, 1, 100, &[1, 2]);
+        // an orphan of the old version stays an orphan
+        fs::write(
+            fx.file(&format!("deps/serde-{}.d", hx(9)), 10),
+            src("serde", "0.9.0"),
+        )
+        .unwrap();
+        let r = fx.run(&cfg());
+        assert_eq!(
+            reasons(&r),
+            [
+                ("orphan", 1),
+                ("outdated dependency", 2),
+                ("unreachable", 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn build_scripts_live_while_used() {
+        let fx = Fx::new("bscript");
+        let kind = "build-script-build-script-build";
+        fx.unit_json("app", A, 7200, kind, LIB, 5); // older, but the lib below uses it
+        fx.unit_json("app", B, 10, kind, LIB, 6);
+        fx.node("app", C, 10, 1, 7, &[5]);
+        assert_eq!(fx.run(&cfg()).removed_units, 0);
+    }
+
+    #[test]
+    fn size_cap_evicts_until_under_the_cap() {
+        let fx = Fx::new("cap2");
+        fx.lib("a", A, 9000, false);
+        fx.lib("b", B, 5000, false);
+        fx.lib("c", C, 10, false);
+        let r = fx.run(&Config {
+            max_size: Some(8000),
+            ..cfg()
+        });
+        assert_eq!(reasons(&r), [("size cap", 2)]);
+        assert!(fx.exists(&format!("deps/libc-{C}.rlib")));
+    }
+
+    #[test]
+    fn size_cap_takes_incremental_first_at_equal_age() {
+        let fx = Fx::new("capinc");
+        fx.lib("x", A, 100, false);
+        fx.file("incremental/x-1/s-x/a.bin", 100);
+        let t = SystemTime::now() - Duration::from_secs(100);
+        set_time(
+            &fx.prof
+                .join(format!(".fingerprint/x-{A}/invoked.timestamp")),
+            t,
+        );
+        set_time(&fx.prof.join("incremental/x-1"), t);
+        let r = fx.run(&Config {
+            max_size: Some(7500),
+            ..cfg()
+        });
+        assert_eq!((r.removed_units, r.removed_incremental), (0, 1));
+        assert!(fx.exists(&format!("deps/libx-{A}.rlib")));
+    }
+
+    #[test]
+    fn one_incremental_dir_per_unit() {
+        let fx = Fx::new("incpair");
+        fx.lib("app", B, 10, false);
+        for (d, age) in [("app-1", 10), ("app-2", 7200)] {
+            fx.dir(&format!("incremental/{d}/s-x"), age);
+            set_age(&fx.prof.join(format!("incremental/{d}")), age);
+        }
+        assert_eq!(fx.run(&cfg()).removed_incremental, 1);
+        assert!(fx.exists("incremental/app-1") && !fx.exists("incremental/app-2"));
+    }
+
+    #[test]
+    fn orphan_build_dir_claims_its_incremental_dir() {
+        let fx = Fx::new("orphaninc");
+        fx.lib("app", B, 10, false);
+        fx.file(&format!("build/app-{A}/output"), 7200);
+        set_age(&fx.prof.join(format!("build/app-{A}")), 7200);
+        fx.file(&format!("deps/app-{A}.d"), 7200);
+        fx.dir("incremental/app-1/s-x", 7200);
+        set_age(&fx.prof.join("incremental/app-1"), 7200);
+        let r = fx.run(&cfg());
+        assert_eq!((r.removed_units, r.removed_incremental), (1, 1));
+    }
+
+    #[test]
+    fn output_files_are_not_a_kind() {
+        let fx = Fx::new("outputfile");
+        fx.lib("foo", A, 7200, false);
+        fx.file(&format!(".fingerprint/foo-{A}/output-lib-foo"), 7200);
+        fx.lib("foo", B, 10, false);
+        assert_eq!(fx.run(&cfg()).removed_units, 1);
+        assert!(!fx.exists(&format!("deps/libfoo-{A}.rlib")));
+    }
+
+    #[test]
+    fn invoked_timestamp_dates_the_unit() {
+        let fx = Fx::new("stampdate");
+        fx.lib("foo", A, 7200, false);
+        set_age(
+            &fx.prof
+                .join(format!(".fingerprint/foo-{A}/invoked.timestamp")),
+            10,
+        );
+        fx.lib("foo", B, 10, false);
+        set_age(
+            &fx.prof
+                .join(format!(".fingerprint/foo-{B}/invoked.timestamp")),
+            7200,
+        );
+        assert_eq!(fx.run(&cfg()).removed_units, 1);
+        assert!(
+            fx.exists(&format!("deps/libfoo-{A}.rlib"))
+                && !fx.exists(&format!("deps/libfoo-{B}.rlib"))
+        );
+    }
+
+    #[test]
+    fn new_layout_units_and_output_kinds() {
+        let fx = Fx::new("newlayout");
+        fx.new_unit("app", A, 7200, &["libapp.rlib", "libapp.rmeta"]);
+        fx.new_unit("app", B, 10, &["libapp.rlib", "libapp.rmeta"]);
+        fx.new_unit("app", C, 7200, &["libapp.rmeta"]); // check: another output kind
+        fx.new_unit("tool", &hx(1), 7200, &["tool"]); // a binary
+        fx.new_unit("tool", &hx(2), 10, &["tool.d"]); // no output kind
+        fx.new_unit("lib2", &hx(3), 7200, &["liblib2.rlib"]);
+        fx.dir(&format!("build/lib2/{}/out/sub", hx(3)), 7200); // a dir is no binary
+        fx.new_unit("lib2", &hx(4), 10, &["liblib2.rlib"]);
+        let r = fx.run(&cfg());
+        assert_eq!(reasons(&r), [("superseded", 2)]);
+        assert!(
+            !fx.exists(&format!("build/app/{A}")) && !fx.exists(&format!("build/lib2/{}", hx(3)))
+        );
+        assert!(fx.exists(&format!("build/app/{B}")) && fx.exists(&format!("build/app/{C}")));
+        assert!(fx.exists(&format!("build/tool/{}", hx(1))));
+    }
+
+    #[test]
+    fn new_layout_dirs_without_fingerprint() {
+        let fx = Fx::new("newempty");
+        fx.dir(&format!("build/pkg/{}/out", hx(1)), 10); // prepared by cargo, empty: kept
+        fx.file(&format!("build/pkg/{}/out/sub/f", hx(2)), 10); // leftovers: orphan
+        fx.file("build/pkg/abcdef/f", 10); // not a unit dir
+        let r = fx.run(&cfg());
+        assert_eq!(reasons(&r), [("orphan", 1)]);
+        assert!(fx.exists(&format!("build/pkg/{}/out", hx(1))) && fx.exists("build/pkg/abcdef/f"));
+        assert!(!fx.exists(&format!("build/pkg/{}", hx(2))));
+    }
+
+    #[test]
+    fn legacy_copy_of_a_new_layout_unit_is_an_orphan() {
+        let fx = Fx::new("dual");
+        fx.lib("dual", A, 7200, false);
+        fx.new_unit("dual", A, 10, &["libdual.rlib"]);
+        let r = fx.run(&cfg());
+        assert_eq!(reasons(&r), [("orphan", 1)]);
+        assert!(
+            !fx.exists(&format!("deps/libdual-{A}.rlib"))
+                && fx.exists(&format!("build/dual/{A}/out/libdual.rlib"))
+        );
+    }
+
+    #[test]
+    fn new_layout_dep_info_names_the_crate() {
+        let fx = Fx::new("newkrate");
+        fx.new_unit("app", A, 10, &[&format!("app-{A}.d"), "libapp.rlib"]);
+        fx.dir("incremental/app-1/s-x", 10);
+        set_age(&fx.prof.join("incremental/app-1"), 10);
+        assert_eq!(fx.run(&cfg()).removed_incremental, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_layout_incremental_owner_by_hard_link() {
+        let fx = Fx::new("newinclink");
+        fx.new_unit("app", A, 7200, &["libapp.rmeta"]);
+        fx.new_unit("app", B, 10, &["libapp.rmeta"]);
+        for (d, h) in [("app-1", A), ("app-2", B)] {
+            fx.dir(&format!("incremental/{d}/s-x"), 5);
+            fs::hard_link(
+                fx.prof.join(format!("build/app/{h}/out/libapp.rmeta")),
+                fx.prof.join(format!("incremental/{d}/s-x/metadata.rmeta")),
+            )
+            .unwrap();
+            set_age(&fx.prof.join(format!("incremental/{d}")), 5);
+        }
+        let r = fx.run(&cfg());
+        assert_eq!(r.removed_incremental, 1);
+        assert!(!fx.exists("incremental/app-1") && fx.exists("incremental/app-2"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_session_dirs_count_in_incremental() {
+        let fx = Fx::new("incfilter");
+        fx.lib("app", A, 7200, false); // superseded
+        fx.lib("app", B, 10, false);
+        fx.dir("incremental/app-1/s-x", 10);
+        fx.dir("incremental/app-1/other", 10); // not a session: its links don't count
+        fs::hard_link(
+            fx.prof.join(format!("deps/libapp-{A}.rmeta")),
+            fx.prof.join("incremental/app-1/other/metadata.rmeta"),
+        )
+        .unwrap();
+        set_age(&fx.prof.join("incremental/app-1"), 10);
+        fx.file("incremental/app-9.lock", 10); // a file
+        fx.dir("incremental/nodash/s-x", 7200); // no crate-id name
+        let r = fx.run(&cfg());
+        assert_eq!((r.removed_units, r.removed_incremental), (1, 0));
+        assert!(fx.exists("incremental/app-1") && fx.exists("incremental/app-9.lock"));
+        assert!(fx.exists("incremental/nodash"));
+    }
+
+    /// Thresholds are strict: exactly at the limit is still live.
+    #[test]
+    fn exactly_at_a_threshold_is_kept() {
+        let base = SystemTime::now() - Duration::from_secs(10);
+        let fp = |fx: &Fx, pkg: &str, h: &str| fx.prof.join(format!(".fingerprint/{pkg}-{h}"));
+
+        let fx = Fx::new("edge-toolchain");
+        fx.node("util", A, 0, 9, 1, &[]);
+        fx.node("app", B, 0, 1, 2, &[]);
+        set_time(&fp(&fx, "app", B), base);
+        set_time(&fp(&fx, "util", A), base - Duration::from_secs(14 * DAY));
+        assert_eq!(reasons(&fx.run(&cfg())), []);
+
+        let fx = Fx::new("edge-variant");
+        fx.lockfile(&["util"], &[]);
+        fx.unit_json("util", A, 0, "lib-util", LIB, 1);
+        let x = LIB.replace(r#""[]""#, r#""[\"x\"]""#);
+        fx.unit_json("util", B, 0, "lib-util", &x, 2);
+        set_time(&fp(&fx, "util", B), base);
+        set_time(&fp(&fx, "util", A), base - Duration::from_secs(7 * DAY));
+        assert_eq!(reasons(&fx.run(&cfg())), []);
+
+        let fx = Fx::new("edge-lock");
+        fx.lockfile(&["app"], &["dep"]);
+        let lock = base - Duration::from_secs(90);
+        set_time(&fx.root.join("Cargo.lock"), lock);
+        fx.node("app", A, 0, 1, 1, &[]);
+        fx.node("app", B, 0, 1, 2, &[]);
+        fx.node("dep", C, 0, 1, 3, &[]);
+        set_time(&fp(&fx, "app", A), lock); // built in the same second the lock file changed
+        set_time(&fp(&fx, "dep", C), lock);
+        set_time(&fp(&fx, "app", B), base);
+        assert_eq!(reasons(&fx.run(&cfg())), []);
+    }
+
+    #[test]
+    fn units_of_a_removed_target_go() {
+        let fx = Fx::new("removedtarget");
+        fx.lockfile(&["app", "tool"], &[]);
+        fs::create_dir_all(fx.root.join("app/src")).unwrap();
+        fs::write(fx.root.join("app/src/main.rs"), "").unwrap();
+        fx.lib("app", A, 10, false);
+        fs::write(
+            fx.prof.join(format!("deps/app-{A}.d")),
+            "x: app/src/main.rs\n",
+        )
+        .unwrap();
+        fx.lib("tool", B, 10, false);
+        fs::write(
+            fx.prof.join(format!("deps/tool-{B}.d")),
+            "x: tool/src/main.rs\n",
+        )
+        .unwrap();
+        assert_eq!(reasons(&fx.run(&cfg())), [("removed target", 1)]);
+        assert!(
+            fx.exists(&format!("deps/libapp-{A}.rlib"))
+                && !fx.exists(&format!("deps/libtool-{B}.rlib"))
+        );
+    }
+
+    #[test]
+    fn legacy_build_dirs_are_not_package_dirs() {
+        let fx = Fx::new("legacybuild");
+        fx.file(
+            &format!(".fingerprint/libc-{A}/run-build-script-build-script-build"),
+            10,
+        );
+        set_age(&fx.prof.join(format!(".fingerprint/libc-{A}")), 10);
+        fx.file(&format!("build/libc-{A}/{}/data", hx(5)), 10); // OUT_DIR-like content
+        fx.file("build/stray-file", 10);
+        assert_eq!(reasons(&fx.run(&cfg())), []);
+        assert!(fx.exists(&format!("build/libc-{A}/{}/data", hx(5))));
     }
 
     #[test]

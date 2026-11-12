@@ -335,7 +335,6 @@ pub(crate) fn plan(
 fn outdated_units(units: &BTreeMap<String, Unit>, ws: &Workspace) -> HashSet<String> {
     let registry: Vec<(&String, &Unit)> = units
         .iter()
-        .filter(|(_, u)| u.has_fingerprint && u.dep_info.is_some())
         .filter(|(_, u)| !ws.is_local(u.name.as_deref().unwrap_or("")))
         .collect();
     let versions = par_map(registry, |(h, u)| {

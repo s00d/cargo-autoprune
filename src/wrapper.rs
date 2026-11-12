@@ -17,8 +17,8 @@ pub fn run_wrapper(args: Vec<OsString>) -> ! {
     let profile = out_dir(&args).as_deref().and_then(profile_of);
     if let Some(profile) = &profile {
         // both are needed even with the background prune off
-        tag_workspace_wrapper(&args, profile);
-        record_unit(&args, profile);
+        tag_workspace_wrapper(&args, profile, env::var_os("RUSTC_WORKSPACE_WRAPPER"));
+        record_unit(&args, profile, env::var_os("CARGO_MANIFEST_DIR"));
     }
     let enabled = env::var_os("CARGO_AUTOPRUNE").is_none_or(|v| v != "0");
     let mut cmd = match env::var_os("CARGO_AUTOPRUNE_WRAPPER").filter(|w| !w.is_empty()) {
@@ -150,8 +150,8 @@ fn extra_filename(args: &[OsString]) -> Option<String> {
 /// Record which package dir a unit belongs to, so the pruner knows its workspace (`Cargo.lock`)
 /// even with a separate `build.build-dir` or a target dir shared by several workspaces, where
 /// same-named packages would otherwise look alike. One append per path-package compile.
-fn record_unit(args: &[OsString], profile: &Path) {
-    let Some(dir) = env::var_os("CARGO_MANIFEST_DIR") else {
+fn record_unit(args: &[OsString], profile: &Path, manifest_dir: Option<OsString>) {
+    let Some(dir) = manifest_dir else {
         return;
     };
     let Some(dir) = dir.to_str() else { return };
@@ -179,10 +179,10 @@ fn record_unit(args: &[OsString], profile: &Path) {
 
 /// clippy-driver (RUSTC_WORKSPACE_WRAPPER) units have the same fingerprint json as plain
 /// `check` units; tag them so the pruner keeps both variants. Costs nothing for plain rustc.
-fn tag_workspace_wrapper(args: &[OsString], profile: &Path) {
+fn tag_workspace_wrapper(args: &[OsString], profile: &Path, ws: Option<OsString>) {
     // cargo-clippy exports RUSTC_WORKSPACE_WRAPPER; it changes the hash of every workspace unit,
     // including build scripts that cargo compiles with plain rustc.
-    let ws = env::var_os("RUSTC_WORKSPACE_WRAPPER").filter(|w| !w.is_empty());
+    let ws = ws.filter(|w| !w.is_empty());
     let prog = match ws
         .as_deref()
         .map(Path::new)
@@ -202,22 +202,39 @@ fn tag_workspace_wrapper(args: &[OsString], profile: &Path) {
     }
 }
 
-fn maybe_trigger(profile: &Path) {
+/// A background prune is due: the stamp is older than `interval` (or missing). Renews it.
+fn claim_stamp(profile: &Path, interval: Duration, now: SystemTime) -> bool {
     let stamp = profile.join(STAMP);
-    let interval = env_secs("CARGO_AUTOPRUNE_INTERVAL", DEFAULT_INTERVAL);
     let fresh = std::fs::metadata(&stamp)
         .and_then(|m| m.modified())
         .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .and_then(|t| now.duration_since(t).ok())
         .is_some_and(|age| age < interval);
     if fresh {
-        return;
+        return false;
     }
-    show_notices(profile);
     let _ = std::fs::create_dir_all(stamp.parent().unwrap_or(profile));
-    if File::create(&stamp).is_err() {
+    File::create(&stamp).is_ok()
+}
+
+fn maybe_trigger(profile: &Path) {
+    if !claim_stamp(
+        profile,
+        env_secs("CARGO_AUTOPRUNE_INTERVAL", DEFAULT_INTERVAL),
+        SystemTime::now(),
+    ) {
         return;
     }
+    show_notices(
+        profile,
+        env::var_os("CARGO_AUTOPRUNE_QUIET").is_some(),
+        || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/tty")
+                .ok()
+        },
+    );
     let Ok(me) = env::current_exe() else { return };
     let mut cmd = Command::new(me);
     cmd.arg("--background").arg(profile);
@@ -237,7 +254,7 @@ fn maybe_trigger(profile: &Path) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0208); // DETACHED_PROCESS (0x8) + CREATE_NEW_PROCESS_GROUP (0x200)
     }
     let _ = cmd.spawn(); // never fail the build because of us
 }
@@ -246,7 +263,7 @@ pub fn background(profile: Option<PathBuf>, after: Option<u32>) {
     close_inherited_fds();
     let Some(profile) = profile else { return };
     if let Some(pid) = after {
-        wait_for_exit(pid, Duration::from_secs(6 * 3600));
+        wait_for_exit(pid, Duration::from_secs(21_600)); // 6 h
     }
     let state = profile.join(STATE_DIR);
     let notices = match prune(&profile, &Config::from_env()) {
@@ -269,14 +286,18 @@ extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 
-#[cfg(unix)]
 fn parent_pid() -> Option<u32> {
     // SAFETY: getppid has no preconditions
-    u32::try_from(unsafe { getppid() }).ok().filter(|&p| p > 1)
+    #[cfg(unix)]
+    return real_parent(unsafe { getppid() });
+    #[cfg(not(unix))]
+    return None; // Windows: no cheap parent pid; the pruner relies on cargo's lock there
 }
-#[cfg(not(unix))]
-fn parent_pid() -> Option<u32> {
-    None // Windows: no cheap parent pid; the pruner relies on cargo's lock there
+
+/// A parent worth waiting for: not init/launchd (pid 1, we were orphaned) and not invalid.
+#[cfg(unix)]
+fn real_parent(pid: i32) -> Option<u32> {
+    u32::try_from(pid).ok().filter(|&p| p > 1)
 }
 
 /// Poll until process `pid` is gone (signal 0 only checks existence).
@@ -308,15 +329,14 @@ fn close_inherited_fds() {} // Windows: the spawn already made the std handles n
 
 /// Print pending notices once on the terminal. Not on stderr: cargo stores a crate's stderr and
 /// replays it on every later build until the crate is recompiled.
-fn show_notices(profile: &Path) {
+fn show_notices<W: std::io::Write>(profile: &Path, quiet: bool, tty: impl FnOnce() -> Option<W>) {
     let file = profile.join(STATE_DIR).join(NOTICE_FILE);
-    if !file.exists() || env::var_os("CARGO_AUTOPRUNE_QUIET").is_some() {
+    if !file.exists() || quiet {
         return;
     }
-    let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") else {
+    let Some(mut tty) = tty() else {
         return; // no terminal (IDE, CI): keep them for `cargo autoprune status`
     };
-    use std::io::Write;
     for n in read_notices(&profile.join(STATE_DIR)) {
         let _ = writeln!(tty, "\x1b[1;33mwarning\x1b[0m: cargo-autoprune: {n}");
     }
@@ -326,6 +346,157 @@ fn show_notices(profile: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::testutil::{set_age, Fx, A};
+
+    fn args(a: &[&str]) -> Vec<OsString> {
+        a.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn records_path_package_units_only() {
+        let fx = Fx::new("wrap-record");
+        let units = fx.prof.join(STATE_DIR).join(UNITS_FILE);
+        let a = args(&["rustc", "-C", &format!("extra-filename=-{A}")]);
+        record_unit(&a, &fx.prof, None);
+        record_unit(
+            &a,
+            &fx.prof,
+            Some("/h/.cargo/registry/src/idx/x-1.0.0".into()),
+        );
+        record_unit(
+            &a,
+            &fx.prof,
+            Some("C:\\h\\.cargo\\git\\checkouts\\y-1".into()),
+        );
+        record_unit(&args(&["rustc"]), &fx.prof, Some("/ws/app".into()));
+        assert!(!units.exists());
+        record_unit(&a, &fx.prof, Some("/ws/app".into()));
+        record_unit(&a, &fx.prof, Some("/ws/util".into()));
+        assert_eq!(
+            std::fs::read_to_string(&units).unwrap(),
+            format!("{A}\t/ws/app\n{A}\t/ws/util\n")
+        );
+    }
+
+    #[test]
+    fn tags_clippy_units() {
+        let fx = Fx::new("wrap-tag");
+        let tags = fx.prof.join(STATE_DIR).join(TAGS_DIR);
+        let a = args(&["/bin/rustc", "-C", &format!("extra-filename=-{A}")]);
+        tag_workspace_wrapper(&a, &fx.prof, None);
+        tag_workspace_wrapper(&a, &fx.prof, Some("".into()));
+        tag_workspace_wrapper(&args(&["/x/clippy-driver"]), &fx.prof, None);
+        assert!(!tags.exists());
+        tag_workspace_wrapper(&a, &fx.prof, Some("/x/clippy-driver".into()));
+        assert_eq!(
+            std::fs::read_to_string(tags.join(A)).unwrap(),
+            "clippy-driver"
+        );
+        std::fs::remove_dir_all(&tags).unwrap();
+        let mut b = a.clone();
+        b[0] = "/x/clippy-driver".into();
+        tag_workspace_wrapper(&b, &fx.prof, None);
+        assert_eq!(
+            std::fs::read_to_string(tags.join(A)).unwrap(),
+            "clippy-driver"
+        );
+        std::fs::remove_dir_all(&tags).unwrap();
+        tag_workspace_wrapper(&b, &fx.prof, Some("/x/rustc-1.80".into()));
+        assert!(!tags.exists());
+    }
+
+    #[test]
+    fn stamp_limits_background_prunes() {
+        let fx = Fx::new("wrap-stamp");
+        let hour = Duration::from_secs(3600);
+        assert!(
+            claim_stamp(&fx.prof, hour, SystemTime::now()),
+            "no stamp yet"
+        );
+        assert!(
+            !claim_stamp(&fx.prof, hour, SystemTime::now()),
+            "just renewed"
+        );
+        set_age(&fx.prof.join(STAMP), 1800);
+        assert!(!claim_stamp(&fx.prof, hour, SystemTime::now()));
+        set_age(&fx.prof.join(STAMP), 7200);
+        assert!(claim_stamp(&fx.prof, hour, SystemTime::now()));
+        assert!(
+            !claim_stamp(&fx.prof, hour, SystemTime::now()),
+            "renewed again"
+        );
+        let t = std::fs::metadata(fx.prof.join(STAMP))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(!claim_stamp(
+            &fx.prof,
+            hour,
+            t + hour - Duration::from_millis(1)
+        ));
+        assert!(
+            claim_stamp(&fx.prof, hour, t + hour),
+            "exactly one interval old"
+        );
+    }
+
+    #[test]
+    fn notices_go_to_the_terminal_once() {
+        let fx = Fx::new("wrap-notices");
+        let state = fx.prof.join(STATE_DIR);
+        let file = state.join(NOTICE_FILE);
+        let mut opened = false;
+        show_notices(&fx.prof, false, || {
+            opened = true;
+            None::<Vec<u8>>
+        });
+        assert!(!opened, "no notices: the terminal is not even opened");
+        std::fs::create_dir_all(&state).unwrap();
+        crate::state::add_notice(&state, "one");
+        crate::state::add_notice(&state, "two");
+        show_notices(&fx.prof, true, || Some(Vec::new()));
+        show_notices(&fx.prof, false, || None::<Vec<u8>>);
+        assert!(file.exists(), "quiet, or no terminal: kept for `status`");
+        let mut out = Vec::new();
+        show_notices(&fx.prof, false, || Some(&mut out));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[1;33mwarning\x1b[0m: cargo-autoprune: one\n\x1b[1;33mwarning\x1b[0m: cargo-autoprune: two\n"
+        );
+        assert!(!file.exists(), "shown once");
+    }
+
+    #[test]
+    fn hash_shape() {
+        assert!(is_hash("0123456789abcdef"));
+        assert!(!is_hash("0123456789abcde"));
+        assert!(!is_hash("0123456789abcdeg"));
+        assert!(!is_hash("0123456789ABCDEF"));
+        let b = args(&["--out-dir", "/t/debug/build/probe/860b9d940d21e6fc/x"]);
+        assert_eq!(unit_hash(&b), None);
+        let b = args(&["--out-dir", "/t/debug/build/probe/860b9d940d21e6fz/out"]);
+        assert_eq!(unit_hash(&b), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waits_for_a_process_to_exit() {
+        use std::time::Instant;
+        assert_eq!(parent_pid(), Some(std::os::unix::process::parent_id()));
+        assert_eq!([-1, 0, 1, 2].map(real_parent), [None, None, None, Some(2)]);
+        let t = Instant::now();
+        wait_for_exit(std::process::id(), Duration::from_millis(300));
+        let waited = t.elapsed();
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let t = Instant::now();
+        wait_for_exit(pid, Duration::from_secs(30));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn finds_out_dir() {

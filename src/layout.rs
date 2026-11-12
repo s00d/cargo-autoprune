@@ -142,6 +142,111 @@ mod tests {
     use super::*;
     const A: &str = "aaaaaaaaaaaaaaaa";
 
+    use crate::testutil::Fx;
+    use std::fs;
+
+    #[test]
+    fn output_kinds() {
+        for (rest, kind) in [
+            (".rlib", Some("rlib")),
+            (".rmeta", Some("rmeta")),
+            (".dylib", Some("dylib")),
+            (".so", Some("dylib")),
+            (".dll", Some("dylib")),
+            (".a", Some("staticlib")),
+            (".lib", Some("staticlib")),
+            (".exe", Some("bin")),
+            (".wasm", Some("bin")),
+            ("", Some("bin")),
+            (".d", None),
+            (".x.rcgu.o", None),
+        ] {
+            assert_eq!(out_kind(rest, false), kind, "{rest}");
+        }
+        assert_eq!(out_kind("", true), None, "a .dSYM-like dir");
+        assert_eq!(out_kind(".rlib", true), None);
+    }
+
+    #[test]
+    fn fingerprints_in_both_layouts() {
+        let fx = Fx::new("layout-fp");
+        let b = "bbbbbbbbbbbbbbbb";
+        fx.dir(&format!(".fingerprint/old-{A}"), 0);
+        fx.dir(&format!("build/new/{b}/fingerprint"), 0);
+        fx.dir("build/new/cccccccccccccccc/out", 0); // no fingerprint dir
+        fx.file("build/new/dddddddddddddddd/fingerprint", 0); // a file, not a dir
+        fx.dir(&format!("build/legacy-{A}/out/fingerprint"), 0); // legacy build-script dir
+        fx.file("build/stray", 0);
+        let mut h: Vec<String> = fingerprinted_hashes(&fx.prof).into_iter().collect();
+        h.sort();
+        assert_eq!(h, [A, b]);
+        let mut d = fingerprint_dirs(&fx.prof);
+        d.sort();
+        assert_eq!(
+            d,
+            [
+                fx.prof.join(format!(".fingerprint/old-{A}")),
+                fx.prof.join(format!("build/new/{b}/fingerprint")),
+            ]
+        );
+    }
+
+    #[test]
+    fn target_and_profile_dirs() {
+        let fx = Fx::new("layout-dirs");
+        let t = fx.root.join("target");
+        for p in ["release", "x86_64-unknown-linux-gnu/debug"] {
+            fs::create_dir_all(t.join(p)).unwrap();
+            fs::write(t.join(p).join(".cargo-lock"), "").unwrap();
+        }
+        fs::create_dir_all(t.join("tmp/sub")).unwrap();
+        fs::write(t.join("file"), "").unwrap();
+        assert_eq!(
+            profile_dirs(&t),
+            [
+                t.join("debug"),
+                t.join("release"),
+                t.join("x86_64-unknown-linux-gnu/debug")
+            ]
+        );
+        assert!(profile_dirs(&fx.root.join("none")).is_empty());
+
+        // more target dirs: found, hidden, node_modules, a tag without profiles, nested
+        let mk = |rel: &str, profile: bool| {
+            let d = fx.root.join(rel);
+            fs::create_dir_all(d.join("debug")).unwrap();
+            fs::write(d.join("CACHEDIR.TAG"), "").unwrap();
+            if profile {
+                fs::write(d.join("debug/.cargo-lock"), "").unwrap();
+            }
+            d
+        };
+        let other = mk("p/q/target", true);
+        mk(".hidden/target", true);
+        mk("node_modules/x/target", true);
+        mk("empty/target", false);
+        mk("target/debug/deps/inner", true); // inside a found target: not descended
+        fs::create_dir_all(fx.root.join("noisy_modules")).unwrap();
+        let in_noisy = mk("noisy_modules/target", true);
+        assert_eq!(find_target_dirs(&fx.root), [in_noisy, other, t.clone()]);
+        assert_eq!(find_target_dirs(&t), [t]);
+    }
+
+    #[test]
+    fn profile_dir_needs_lock_and_tag() {
+        let fx = Fx::new("layout-prof");
+        assert!(is_profile_dir(&fx.prof));
+        let build_dir = fx.root.join("target/x/y/debug");
+        fs::create_dir_all(&build_dir).unwrap();
+        assert!(!is_profile_dir(&build_dir));
+        fs::write(build_dir.join(".cargo-build-lock"), "").unwrap();
+        assert!(is_profile_dir(&build_dir), "tag three levels up");
+        let deep = fx.root.join("target/a/b/c/debug");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join(".cargo-lock"), "").unwrap();
+        assert!(!is_profile_dir(&deep), "tag four levels up");
+    }
+
     #[test]
     fn split_hash_cases() {
         assert_eq!(
@@ -160,5 +265,11 @@ mod tests {
         assert_eq!(split_hash("foo-ABCDEFabcdef0123"), None);
         assert_eq!(split_hash(&format!("foo-{A}x")), None);
         assert_eq!(split_hash("foo"), None);
+        assert_eq!(
+            split_hash(&format!("a-b-c-{A}.rlib")),
+            Some(("a-b-c", A, ".rlib"))
+        );
+        let twice = format!("x-{A}-{A}");
+        assert_eq!(split_hash(&twice), Some((&twice[..18], A, "")));
     }
 }

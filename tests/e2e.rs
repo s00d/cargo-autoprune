@@ -6,7 +6,7 @@ mod support;
 use cargo_autoprune::prune::Config;
 use std::fs;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use support::*;
 
 /// Every kind of unit: lib/bin/test/example/build script, check vs build, release.
@@ -953,6 +953,211 @@ fn cli_accepts_a_directory_without_subcommand() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("units"));
+}
+
+#[test]
+fn no_arguments_is_a_manual_run_of_the_current_project() {
+    // no args: the CLI on ./target, not a wrapper call with no rustc to run
+    let dir = std::env::temp_dir().join(format!("cargo-autoprune-noargs-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(BIN)
+        .current_dir(&dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no Cargo profile dirs under target"));
+}
+
+#[test]
+fn manual_run_sums_what_every_profile_frees() {
+    // a hand-made target: in debug and release, a lib built twice an hour apart (no cargo needed)
+    let root = std::env::temp_dir().join(format!("cargo-autoprune-total-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    for profile in ["debug", "release"] {
+        let p = target.join(profile);
+        for (h, t) in [
+            ("aaaaaaaaaaaaaaaa", hour_ago),
+            ("bbbbbbbbbbbbbbbb", SystemTime::now()),
+        ] {
+            let fp = p.join(format!(".fingerprint/foo-{h}"));
+            fs::create_dir_all(&fp).unwrap();
+            fs::create_dir_all(p.join("deps")).unwrap();
+            for f in [
+                fp.join("lib-foo"),
+                fp.join("lib-foo.json"),
+                fp.join("invoked.timestamp"),
+            ] {
+                fs::write(&f, "").unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(&f)
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap();
+            }
+            fs::write(p.join(format!("deps/libfoo-{h}.rlib")), vec![0u8; 1024]).unwrap();
+        }
+        fs::write(p.join(".cargo-lock"), "").unwrap();
+    }
+    let out = Command::new(BIN).arg(&target).arg("-n").output().unwrap();
+    // the environment's grace (2 h) covers the hour-old copies
+    let graced = Command::new(BIN)
+        .arg(&target)
+        .arg("-n")
+        .env("CARGO_AUTOPRUNE_GRACE", "7200")
+        .output()
+        .unwrap();
+    // phase timings: with -v, or with CARGO_AUTOPRUNE_TRACE
+    let timings = |args: &[&str], trace: bool| {
+        let mut c = Command::new(BIN);
+        c.arg(&target)
+            .args(args)
+            .env_remove("CARGO_AUTOPRUNE_TRACE");
+        if trace {
+            c.env("CARGO_AUTOPRUNE_TRACE", "1");
+        }
+        String::from_utf8_lossy(&c.output().unwrap().stdout).contains(" ms  plan")
+    };
+    assert!(!timings(&["-n"], false));
+    assert!(timings(&["-n", "-v"], false));
+    assert!(timings(&["-n"], true));
+    let _ = fs::remove_dir_all(&root);
+    let graced = String::from_utf8_lossy(&graced.stdout);
+    assert!(graced.ends_with("total: 0B\n"), "{graced}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        stdout.matches("would remove 1 units").count(),
+        2,
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("total: 2.0KiB\n"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_runs_rustc_or_the_chained_wrapper() {
+    let run = |chain: Option<&str>| {
+        let mut c = Command::new(BIN);
+        c.args(["/bin/echo", "hi"]).env("CARGO_AUTOPRUNE", "0");
+        match chain {
+            Some(w) => c.env("CARGO_AUTOPRUNE_WRAPPER", w),
+            None => c.env_remove("CARGO_AUTOPRUNE_WRAPPER"),
+        };
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(run(None), "hi\n");
+    assert_eq!(run(Some("")), "hi\n", "empty: no chained wrapper");
+    assert_eq!(run(Some("/bin/echo")), "/bin/echo hi\n");
+}
+
+/// A CI step or test harness waits for EOF on its pipes: the detached pruner must not hold one
+/// while it waits for cargo to exit.
+#[cfg(unix)]
+#[test]
+fn background_pruner_closes_inherited_pipes() {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    extern "C" {
+        fn pipe(fds: *mut i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        fn dup2(old: i32, new: i32) -> i32;
+    }
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    let mut cargo = Command::new("sleep").arg("30").spawn().unwrap(); // stands in for cargo
+    let mut fds = [0i32; 2];
+    // SAFETY: plain libc calls on descriptors this test owns
+    unsafe {
+        assert_eq!(pipe(fds.as_mut_ptr()), 0);
+        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    }
+    let w = fds[1];
+    let mut bg = Command::new(BIN);
+    bg.arg("--background")
+        .arg("/nonexistent-autoprune/debug")
+        .arg("--after")
+        .arg(cargo.id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null()); // as the wrapper spawns it
+                                              // SAFETY: dup2/fcntl are async-signal-safe; the child gets the pipe as fd 3 without CLOEXEC
+    unsafe {
+        bg.pre_exec(move || {
+            if w == 3 {
+                fcntl(3, F_SETFD, 0);
+            } else {
+                dup2(w, 3);
+            }
+            Ok(())
+        });
+    }
+    let mut child = bg.spawn().unwrap();
+    // SAFETY: both descriptors are ours and wrapped once
+    let (mut reader, writer) = unsafe { (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(w)) };
+    drop(writer);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        tx.send(reader.read_to_end(&mut buf).map(|_| buf.len()))
+            .ok();
+    });
+    let eof = rx.recv_timeout(Duration::from_secs(10));
+    let _ = cargo.kill();
+    let _ = cargo.wait();
+    let _ = child.wait();
+    assert!(
+        matches!(eof, Ok(Ok(0))),
+        "the pruner kept the pipe open: {eof:?}"
+    );
+}
+
+#[test]
+fn background_error_in_a_real_profile_leaves_a_notice() {
+    let root = std::env::temp_dir().join(format!("cargo-autoprune-bgerr-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let debug = root.join("target/debug");
+    fs::create_dir_all(debug.join(".autoprune/lock")).unwrap(); // the prune's own lock can't open
+    fs::write(root.join("target/CACHEDIR.TAG"), "").unwrap();
+    fs::write(debug.join(".cargo-lock"), "").unwrap();
+    let out = Command::new(BIN)
+        .arg("--background")
+        .arg(&debug)
+        .output()
+        .unwrap();
+    let notice = fs::read_to_string(debug.join(".autoprune/notice")).unwrap_or_default();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        notice.starts_with("background prune of ") && notice.contains(" failed: "),
+        "{notice:?}"
+    );
+
+    // no longer a cargo dir (CACHEDIR.TAG gone): nothing is written, even with old state there
+    let bogus = root.join("old/debug");
+    fs::create_dir_all(bogus.join(".autoprune")).unwrap();
+    fs::write(bogus.join(".cargo-lock"), "").unwrap();
+    let out = Command::new(BIN)
+        .arg("--background")
+        .arg(&bogus)
+        .output()
+        .unwrap();
+    let written = bogus.join(".autoprune/notice").exists();
+    let _ = fs::remove_dir_all(&root);
+    assert!(out.status.success() && !written, "{out:?}");
 }
 
 #[test]

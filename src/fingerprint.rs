@@ -37,7 +37,12 @@ impl Workspace {
 }
 
 /// First prerequisite of the first rule in a make-style dep-info file (`out: src/main.rs ...`).
+/// Backslash escapes spaces in rustc's dep-info except on Windows, where it separates paths.
 pub(crate) fn first_dependency(text: &str) -> Option<String> {
+    first_dependency_with(text, !cfg!(windows))
+}
+
+fn first_dependency_with(text: &str, escapes: bool) -> Option<String> {
     let (_, deps) = text.lines().next()?.split_once(": ")?;
     let mut out = String::new();
     let mut esc = false;
@@ -47,7 +52,7 @@ pub(crate) fn first_dependency(text: &str) -> Option<String> {
                 out.push(ch);
                 esc = false;
             }
-            '\\' if !cfg!(windows) => esc = true,
+            '\\' if escapes => esc = true,
             ' ' if !out.is_empty() => break,
             ' ' => {}
             _ => out.push(ch),
@@ -260,7 +265,105 @@ mod tests {
             first_dependency("/t/x: /a\\ b/lib.rs /c.rs").as_deref(),
             Some("/a b/lib.rs")
         );
+        assert_eq!(
+            first_dependency_with("C:\\t\\x.d: C:\\ws\\src\\main.rs C:\\ws\\Cargo.toml", false)
+                .as_deref(),
+            Some("C:\\ws\\src\\main.rs")
+        );
+        assert_eq!(
+            first_dependency_with("/t/x: /a\\ b/lib.rs /c.rs", true).as_deref(),
+            Some("/a b/lib.rs")
+        );
         assert_eq!(first_dependency("/t/x:"), None);
+        assert_eq!(
+            first_dependency("/t/x:  a.rs b.rs").as_deref(),
+            Some("a.rs")
+        );
+        assert_eq!(first_dependency("/t/x:   ").as_deref(), None);
+    }
+
+    #[test]
+    fn removed_target_by_dep_info() {
+        let fx = crate::testutil::Fx::new("fp-removed");
+        let root = fx.root.join("ws");
+        fs::create_dir_all(root.join("app/src")).unwrap();
+        fs::write(root.join("app/src/main.rs"), "").unwrap();
+        let ws = Workspace {
+            roots: vec![fx.root.join("other"), root.clone()],
+            locals: HashSet::new(),
+            versions: HashMap::new(),
+            lock_changed: None,
+        };
+        let d = fx.root.join("x.d");
+        fs::write(&d, "/t/x.d: app/src/main.rs\n").unwrap();
+        assert!(!ws.target_removed(&d));
+        fs::write(&d, "/t/x.d: app/src/old.rs\n").unwrap();
+        assert!(ws.target_removed(&d));
+        fs::write(
+            &d,
+            format!("/t/x.d: {}\n", root.join("app/src/main.rs").display()),
+        )
+        .unwrap();
+        assert!(!ws.target_removed(&d), "absolute path");
+        assert!(!ws.target_removed(&fx.root.join("missing.d")));
+    }
+
+    #[test]
+    fn workspaces_of_a_profile() {
+        let fx = crate::testutil::Fx::new("fp-ws");
+        fx.lockfile(&["app"], &["serde"]);
+        let other = fx.root.join("elsewhere/proj");
+        fs::create_dir_all(other.join("pkg")).unwrap();
+        fs::write(
+            other.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"tool\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"serde\"\nversion = \"2.0.0\"\nsource = \"registry+x\"\n",
+        )
+        .unwrap();
+        let state = fx.prof.join(STATE_DIR);
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join(UNITS_FILE),
+            format!(
+                "{a}\t{p}\n{b}\t{p}\nbad line\n{a}\t{r}\n",
+                a = crate::testutil::A,
+                b = crate::testutil::B,
+                p = other.join("pkg").display(),
+                r = fx.root.display()
+            ),
+        )
+        .unwrap();
+        let rec = recorded_units(&fx.prof);
+        assert_eq!(rec.len(), 2);
+        assert_eq!(rec[crate::testutil::A], fx.root, "last record wins");
+        let (ws, homes) = workspace(&fx.prof);
+        let ws = ws.unwrap();
+        assert_eq!(ws.roots, [fx.root.clone(), other.clone()]);
+        assert!(ws.is_local("app") && ws.is_local("tool") && !ws.is_local("serde"));
+        let mut v: Vec<&String> = ws.versions["serde"].iter().collect();
+        v.sort();
+        assert_eq!(v, ["1.0.0", "2.0.0"]);
+        assert_eq!(ws.versions.len(), 1);
+        assert_eq!(homes[crate::testutil::B], other);
+        assert!(ws.lock_changed.is_some());
+    }
+
+    #[test]
+    fn sibling_profiles_dep_values() {
+        let fx = crate::testutil::Fx::new("fp-sibling");
+        fx.node("own", crate::testutil::A, 0, 1, 10, &[11]);
+        let rel = fx.root.join("target/release");
+        fs::create_dir_all(rel.join(".fingerprint/x-cccccccccccccccc")).unwrap();
+        fs::write(rel.join(".cargo-lock"), "").unwrap();
+        fs::write(
+            rel.join(".fingerprint/x-cccccccccccccccc/lib-x.json"),
+            r#"{"rustc":1,"deps":[[1,"a",false,21],[2,"b",false,22]],"local":[]}"#,
+        )
+        .unwrap();
+        fs::write(rel.join(".fingerprint/x-cccccccccccccccc/lib-x"), "ffff").unwrap();
+        let mut v = sibling_dep_values(&fx.prof);
+        v.sort();
+        assert_eq!(v, [21, 22]);
+        assert!(sibling_dep_values(&std::env::temp_dir().join("no-such-autoprune")).is_empty());
     }
 
     #[test]
@@ -296,6 +399,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source_version(&f, "dep_g"), None);
+        for bad in [
+            "memchr-.8.2",
+            "memchr-2.x.3",
+            "memchr-x.1.2",
+            "memchr-1.2.x",
+            "memchr-1.2",
+        ] {
+            fs::write(
+                &f,
+                format!("/t/x.d: /h/registry/src/idx/{bad}/src/lib.rs\n"),
+            )
+            .unwrap();
+            assert_eq!(source_version(&f, "memchr"), None, "{bad}");
+        }
         fs::write(
             &f,
             "/t/x.d: /h/registry/src/idx/proc-macro2-1.0.95-rc.1/src/lib.rs\n",
@@ -315,6 +432,10 @@ mod tests {
         assert_eq!(
             parse_fingerprint_json(r#"{"rustc":1,"deps":[],"local":[]}"#),
             (1, vec![])
+        );
+        assert_eq!(
+            parse_fingerprint_json(r#"{"deps":[[7],[8]]}"#),
+            (0, vec![7, 8])
         );
         assert_eq!(parse_le_hex("d5dd8855943b3fe2"), Some(16302814684380716501));
         assert_eq!(parse_le_hex("xyz"), None);

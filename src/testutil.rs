@@ -121,6 +121,44 @@ impl Fx {
         set_age(&self.prof.join(&fp), age);
         self.file(&format!("deps/lib{}-{h}.rlib", pkg.replace('-', "_")), age);
     }
+    /// A unit with a hand-written fingerprint: `kind` names the fingerprint files.
+    pub(crate) fn unit_json(
+        &self,
+        pkg: &str,
+        h: &str,
+        age: u64,
+        kind: &str,
+        json: &str,
+        value: u64,
+    ) {
+        let fp = format!(".fingerprint/{pkg}-{h}");
+        self.file(&format!("{fp}/{kind}"), age);
+        fs::write(self.prof.join(format!("{fp}/{kind}")), hex_le(value)).unwrap();
+        self.file(&format!("{fp}/{kind}.json"), age);
+        fs::write(self.prof.join(format!("{fp}/{kind}.json")), json).unwrap();
+        for f in [kind.to_owned(), format!("{kind}.json")] {
+            set_age(&self.prof.join(&fp).join(f), age);
+        }
+        set_age(&self.prof.join(&fp), age);
+    }
+    /// A unit in cargo 1.100's build-dir layout: `build/<pkg>/<hash>/{fingerprint,out}`.
+    pub(crate) fn new_unit(&self, pkg: &str, h: &str, age: u64, outs: &[&str]) {
+        let d = format!("build/{pkg}/{h}");
+        for f in [
+            format!("lib-{pkg}"),
+            format!("lib-{pkg}.json"),
+            "invoked.timestamp".into(),
+        ] {
+            self.file(&format!("{d}/fingerprint/{f}"), age);
+        }
+        set_age(&self.prof.join(format!("{d}/fingerprint")), age);
+        self.dir(&format!("{d}/out"), age);
+        for o in outs {
+            self.file(&format!("{d}/out/{o}"), age);
+        }
+        set_age(&self.prof.join(format!("{d}/out")), age);
+        set_age(&self.prof.join(&d), age);
+    }
     pub(crate) fn lockfile(&self, locals: &[&str], registry: &[&str]) {
         let mut s = String::from("version = 4\n");
         for n in locals {

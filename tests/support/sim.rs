@@ -667,13 +667,19 @@ impl Sim {
                 outputs.push(dep_info(&out, &format!("{krate}-{h}.d")));
             }
             (Shape::Lib | Shape::Rmeta, true) => {
+                // as cargo 1.100 writes them: libs keep the hash in their names
                 if n.shape == Shape::Lib {
-                    outputs.push((out.join(format!("lib{krate}.rlib")), big.clone()));
+                    outputs.push((out.join(format!("lib{krate}-{h}.rlib")), big.clone()));
                 }
-                outputs.push((out.join(format!("lib{krate}.rmeta")), small.clone()));
+                outputs.push((out.join(format!("lib{krate}-{h}.rmeta")), small.clone()));
                 outputs.push(dep_info(&out, &format!("{krate}-{h}.d")));
             }
-            (Shape::Exe, _) => {
+            (Shape::Exe, true) => {
+                // executables don't: `out/<crate>`, `out/<crate>.d`
+                outputs.push((out.join(&krate), big.clone()));
+                outputs.push(dep_info(&out, &format!("{krate}.d")));
+            }
+            (Shape::Exe, false) => {
                 outputs.push((out.join(format!("{krate}-{h}")), big.clone()));
                 outputs.push(dep_info(&out, &format!("{krate}-{h}.d")));
                 outputs.push((

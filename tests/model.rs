@@ -109,6 +109,14 @@ fn prune_and_check(s: &Sim, cfg: &Config, fresh: bool) -> Report {
         !s.prof.join(STATE_DIR).join("trash").exists(),
         "the trash is emptied"
     );
+    for pkg in entries(&s.prof.join("build")) {
+        let p = pkg.path();
+        assert!(
+            !p.is_dir() || !entries(&p).is_empty(),
+            "an empty package dir is left: {}",
+            p.display()
+        );
+    }
     let names = |r: &Report| {
         let mut v: Vec<String> = r
             .removed

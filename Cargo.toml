@@ -6,7 +6,6 @@ rust-version = "1.89"
 description = "rustc-wrapper that keeps Cargo target/ dirs from growing: prunes superseded artifacts in the background after builds"
 license = "MIT"
 repository = "https://github.com/s00d/cargo-autoprune"
-homepage = "https://github.com/s00d/cargo-autoprune"
 readme = "README.md"
 keywords = ["cargo", "target", "clean", "disk-space", "build"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]

@@ -6,7 +6,7 @@
 
 pub mod sim;
 
-use cargo_autoprune::layout::profile_dirs;
+use cargo_autoprune::layout::{profile_dirs, split_hash};
 use cargo_autoprune::prune::{prune, Config, Outcome, Report};
 use std::collections::BTreeSet;
 use std::fs;
@@ -34,18 +34,19 @@ pub fn remove_tree(p: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn writable(p: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if p.is_dir() && !p.is_symlink() {
-            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
-            for e in fs::read_dir(p).into_iter().flatten().flatten() {
-                writable(&e.path());
-            }
+    use std::os::unix::fs::PermissionsExt;
+    if p.is_dir() && !p.is_symlink() {
+        let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+        for e in fs::read_dir(p).into_iter().flatten().flatten() {
+            writable(&e.path());
         }
     }
 }
+
+#[cfg(not(unix))]
+fn writable(_: &Path) {} // the read-only story is unix only
 
 /// [`tmp`], emptied first.
 pub fn scratch(name: &str) -> PathBuf {
@@ -344,17 +345,69 @@ impl Ws {
             .sum()
     }
 
+    /// Unit outputs of a profile starting with `prefix`, in either layout (see [`outputs`]).
     pub fn deps_files(&self, profile: &str, prefix: &str) -> Vec<String> {
-        let mut v: Vec<String> = fs::read_dir(self.target.join(profile).join("deps"))
-            .map(|rd| {
-                rd.filter_map(|e| e.ok()?.file_name().into_string().ok())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut v = outputs(&self.target.join(profile));
         v.retain(|n| n.starts_with(prefix));
-        v.sort();
         v
     }
+}
+
+fn names(p: &Path) -> Vec<(String, PathBuf)> {
+    fs::read_dir(p)
+        .map(|rd| {
+            rd.filter_map(|e| {
+                let e = e.ok()?;
+                Some((e.file_name().into_string().ok()?, e.path()))
+            })
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Unit dirs of the new layout (cargo 1.100+): `build/<pkg>/<hash>`, with the hash.
+fn unit_dirs(prof: &Path) -> Vec<(String, PathBuf)> {
+    names(&prof.join("build"))
+        .into_iter()
+        .filter(|(pkg, _)| split_hash(pkg).is_none())
+        .flat_map(|(_, p)| names(&p))
+        .filter(|(h, p)| h.len() == 16 && p.is_dir())
+        .collect()
+}
+
+/// Output files of a profile's units in either layout, named as in the legacy `deps/`: a new-layout
+/// `build/<pkg>/<hash>/out/<name>` gets the hash when its name has none (`tool` -> `tool-<hash>`).
+pub fn outputs(prof: &Path) -> Vec<String> {
+    let mut v: Vec<String> = names(&prof.join("deps"))
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    for (h, dir) in unit_dirs(prof) {
+        for (n, _) in names(&dir.join("out")) {
+            v.push(match (split_hash(&n), n.split_once('.')) {
+                (Some(_), _) => n,
+                (None, Some((stem, ext))) => format!("{stem}-{h}.{ext}"),
+                (None, None) => format!("{n}-{h}"),
+            });
+        }
+    }
+    v.sort();
+    v
+}
+
+/// Fingerprint dirs of a profile's units in either layout.
+pub fn fingerprints(prof: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = names(&prof.join(".fingerprint"))
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
+    v.extend(
+        unit_dirs(prof)
+            .into_iter()
+            .map(|(_, p)| p.join("fingerprint"))
+            .filter(|f| f.is_dir()),
+    );
+    v
 }
 
 impl Drop for Ws {

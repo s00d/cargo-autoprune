@@ -322,6 +322,15 @@ pub fn prune_at(profile: &Path, cfg: &Config, now: SystemTime) -> io::Result<Out
         new_deleted.push(c.id.clone());
     }
     flush(&mut files, &mut report.errors);
+    if !cfg.dry_run {
+        // new layout: `build/<pkg>/` left without unit dirs is gone too, as in a fresh build
+        let build = profile.join("build");
+        for p in &report.removed {
+            if let Some(pkg) = p.parent().filter(|d| d.parent() == Some(build.as_path())) {
+                let _ = fs::remove_dir(pkg); // only when empty
+            }
+        }
+    }
     ph.mark("delete (locked)");
     if !cfg.dry_run {
         let mut deleted = deleted_before;

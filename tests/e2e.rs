@@ -199,9 +199,7 @@ fn orphaned_objects_and_dep_info_removed() {
     ws.deps(A10);
     ws.run_all(&CMDS[..2]);
     // what an rm of test executables leaves behind: .d, .o and the fingerprint
-    let fp = ws.target.join("debug/.fingerprint");
-    for e in fs::read_dir(&fp).unwrap() {
-        let p = e.unwrap().path();
+    for p in support::fingerprints(&ws.target.join("debug")) {
         if fs::read_dir(&p).unwrap().any(|f| {
             f.unwrap()
                 .file_name()
@@ -274,9 +272,8 @@ fn shared_target_without_lockfile_still_deduplicates() {
         )
         .unwrap();
     }
-    let deps: Vec<String> = fs::read_dir(shared.join("debug/deps"))
-        .unwrap()
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+    let deps: Vec<String> = support::outputs(&shared.join("debug"))
+        .into_iter()
         .filter(|n| n.starts_with("libdep_a-") && n.ends_with(".rlib"))
         .collect();
     assert_eq!(deps.len(), 1, "superseded dep_a rlib should go: {deps:?}");
@@ -610,9 +607,8 @@ fn separate_build_dir() {
         )
         .unwrap();
     }
-    let rlibs: Vec<_> = fs::read_dir(bd.join("debug/deps"))
-        .unwrap()
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+    let rlibs: Vec<_> = support::outputs(&bd.join("debug"))
+        .into_iter()
         .filter(|n| n.starts_with("libdep_a-") && n.ends_with(".rlib"))
         .collect();
     assert_eq!(rlibs.len(), 1, "{rlibs:?}");
@@ -680,9 +676,8 @@ fn two_workspaces_share_one_target_dir() {
     a.deps(A10); // dep_b removed from a: no Cargo.lock next to the shared target, roots recorded
     all(&a);
     prune_all();
-    let left: Vec<String> = fs::read_dir(shared.join("debug/deps"))
-        .unwrap()
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+    let left: Vec<String> = support::outputs(&shared.join("debug"))
+        .into_iter()
         .filter(|n| n.starts_with("libdep_b-"))
         .collect();
     assert!(left.is_empty(), "removed dependency kept: {left:?}");
@@ -699,43 +694,49 @@ fn oracle_rebuild(ws: &Ws, cmds: &[&str], env: &[(&str, &str)]) -> std::path::Pa
     oracle
 }
 
-fn nightly_new_layout() -> Option<[(&'static str, &'static str); 2]> {
+/// A cargo that still writes the legacy layout (`deps/`, `.fingerprint/`): cargo 1.99, installed
+/// next to the current one (`rustup toolchain install 1.99.1`).
+fn legacy_cargo() -> Option<[(&'static str, &'static str); 1]> {
     let ok = Command::new("rustup")
-        .args(["run", "nightly", "cargo", "-V"])
+        .args(["run", "1.99.1", "cargo", "-V"])
         .output()
         .is_ok_and(|o| o.status.success());
-    ok.then_some([
-        ("RUSTUP_TOOLCHAIN", "nightly"),
-        ("CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT", "true"),
-    ])
+    ok.then_some([("RUSTUP_TOOLCHAIN", "1.99.1")])
+}
+
+/// Legacy-layout outputs: `deps/` of a profile.
+fn legacy_deps(ws: &Ws, prefix: &str) -> Vec<String> {
+    fs::read_dir(ws.target.join("debug/deps"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with(prefix))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[test]
 fn new_build_dir_layout() {
     // cargo 1.100's layout: build/<pkg>/<hash>/{fingerprint,out,run}
-    let Some(env) = nightly_new_layout() else {
-        eprintln!("no nightly toolchain, skipped");
-        return;
-    };
     let ws = Ws::new("newlayout");
     let cmds = &CMDS[..3];
     let run = |deps: &str| {
         ws.deps(deps);
         for c in cmds {
-            ws.cargo_in(c, &ws.target.clone(), true, &env);
+            ws.cargo_in(c, &ws.target.clone(), true, &[]);
         }
     };
     run(&format!("{A10}\ndep_b = \"1\""));
     assert!(
         ws.target.join("debug/build/dep_a").is_dir(),
-        "not the new layout"
+        "not the new layout: cargo 1.100+ needed"
     );
     run(&format!("{A11}\ndep_b = \"1\""));
     let reports = ws.prune();
     assert!(reports.iter().map(|r| r.removed_units).sum::<usize>() > 0);
     let oracle = ws.root.join("oracle-new");
     for c in cmds {
-        ws.cargo_in(c, &oracle, false, &env);
+        ws.cargo_in(c, &oracle, false, &[]);
     }
     let (a, b) = (inventory(&ws.target), inventory(&oracle));
     let left: Vec<_> = a.difference(&b).collect();
@@ -743,27 +744,26 @@ fn new_build_dir_layout() {
     assert!(lost.is_empty(), "{lost:#?}");
     assert!(left.is_empty(), "{left:#?}");
     for c in cmds {
-        assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &env), 0);
+        assert_eq!(ws.cargo_in(c, &ws.target.clone(), true, &[]), 0);
     }
 }
 
 #[test]
 fn upgrade_from_the_legacy_layout() {
     // a target built by an older cargo, then by one with the new layout: the old units are dead
-    let Some(env) = nightly_new_layout() else {
-        eprintln!("no nightly toolchain, skipped");
+    let Some(legacy) = legacy_cargo() else {
+        eprintln!("no cargo 1.99.1 (rustup toolchain install 1.99.1), skipped");
         return;
     };
     let ws = Ws::new("upgrade");
     ws.deps(A10);
-    ws.cargo(CMDS[0]); // the current cargo: legacy layout
-    let legacy = ws.deps_files("debug", "libdep_a-").len();
-    assert!(legacy > 0);
+    ws.cargo_in(CMDS[0], &ws.target.clone(), true, &legacy);
+    assert!(!legacy_deps(&ws, "libdep_a-").is_empty());
     age_tree(&ws.target, 2 * 24 * 3600); // two days later the toolchain is upgraded
-    ws.cargo_in(CMDS[0], &ws.target.clone(), true, &env);
+    ws.cargo(CMDS[0]);
     ws.prune();
     assert!(
-        ws.deps_files("debug", "libdep_a-").is_empty(),
+        legacy_deps(&ws, "libdep_a-").is_empty(),
         "legacy dep_a copies left"
     );
     assert!(
@@ -772,7 +772,7 @@ fn upgrade_from_the_legacy_layout() {
             .unwrap_or(false),
         "legacy fingerprints left"
     );
-    assert_eq!(ws.cargo_in(CMDS[0], &ws.target.clone(), true, &env), 0);
+    assert_eq!(ws.cargo(CMDS[0]), 0);
 }
 
 #[test]
@@ -1184,15 +1184,27 @@ fn background_failure_leaves_a_notice() {
     {
         use std::os::unix::fs::PermissionsExt;
         let debug = ws.target.join("debug");
-        let deps = debug.join("deps");
-        fs::set_permissions(&deps, fs::Permissions::from_mode(0o555)).unwrap(); // unlink fails
+        // where units live, in either layout: deps/, or each build/<pkg>/ (unlink and rename fail)
+        let mut ro: Vec<_> = fs::read_dir(debug.join("build"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir())
+            .collect();
+        ro.push(debug.join("deps"));
+        ro.retain(|p| p.is_dir());
+        let mode = |m| {
+            for p in &ro {
+                fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+            }
+        };
+        mode(0o555);
         let out = Command::new(BIN)
             .arg("--background")
             .arg(&debug)
             .env("CARGO_AUTOPRUNE_GRACE", "0")
             .output()
             .unwrap();
-        fs::set_permissions(&deps, fs::Permissions::from_mode(0o755)).unwrap();
+        mode(0o755);
         assert!(out.status.success());
         let notice = fs::read_to_string(debug.join(".autoprune/notice")).unwrap_or_default();
         assert!(notice.contains("could not delete"), "{notice:?}");

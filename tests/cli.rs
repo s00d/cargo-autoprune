@@ -333,16 +333,19 @@ fn status_reports_the_setup_and_the_target() {
     )
     .unwrap();
     let o = st(&[], &proj.join("sub"));
-    assert!(
-        o.starts_with(&format!(
-            "wrapper: enabled in {}",
-            proj.join(".cargo/config.toml")
-                .canonicalize()
-                .unwrap()
-                .display()
-        )),
+    // the config next to the project, found from a subdir (the printed path may name the same
+    // file another way: macOS `/private`, Windows `\\?\`)
+    let found = o
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("wrapper: enabled in "))
+        .map(Path::new);
+    assert_eq!(
+        found.and_then(|f| f.canonicalize().ok()),
+        proj.join(".cargo").join("config.toml").canonicalize().ok(),
         "{o}"
     );
+    assert!(!o.lines().next().unwrap().contains("\\.cargo/"), "{o}");
 
     let state = s.prof.join(".autoprune");
     fs::write(

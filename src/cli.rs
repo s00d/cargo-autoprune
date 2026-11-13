@@ -240,7 +240,11 @@ fn configured_wrapper(
         .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
     let mut candidates = vec![home.join("config.toml"), home.join("config")];
     if let Some(cwd) = cwd {
-        candidates.extend(cwd.ancestors().map(|a| a.join(".cargo/config.toml")));
+        // joined part by part: one path separator in what `status` prints, also on Windows
+        candidates.extend(
+            cwd.ancestors()
+                .map(|a| a.join(".cargo").join("config.toml")),
+        );
     }
     candidates.into_iter().find_map(|f| {
         let text = fs::read_to_string(&f).ok()?;

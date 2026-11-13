@@ -37,24 +37,16 @@ impl Workspace {
 }
 
 /// First prerequisite of the first rule in a make-style dep-info file (`out: src/main.rs ...`).
-/// Backslash escapes spaces in rustc's dep-info except on Windows, where it separates paths.
+/// rustc escapes only spaces (`\ `), on every platform; any other backslash is part of the path
+/// (a Windows separator).
 pub(crate) fn first_dependency(text: &str) -> Option<String> {
-    first_dependency_with(text, !cfg!(windows))
-}
-
-fn first_dependency_with(text: &str, escapes: bool) -> Option<String> {
     let (_, deps) = text.lines().next()?.split_once(": ")?;
     let mut out = String::new();
-    let mut esc = false;
-    for ch in deps.chars() {
+    let mut chars = deps.trim_start().chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            _ if esc => {
-                out.push(ch);
-                esc = false;
-            }
-            '\\' if escapes => esc = true,
-            ' ' if !out.is_empty() => break,
-            ' ' => {}
+            '\\' if chars.next_if_eq(&' ').is_some() => out.push(' '),
+            ' ' => break,
             _ => out.push(ch),
         }
     }
@@ -178,16 +170,9 @@ pub(crate) fn source_version(dep_info: &Path, pkg: &str) -> Option<String> {
     let prefix = format!("{pkg}-");
     Path::new(&src).components().find_map(|c| {
         let v = c.as_os_str().to_str()?.strip_prefix(&prefix)?;
-        // semver `1.2.3[-pre]`: git checkouts are `<name>-<hash>`, which is no version
-        let numeric = |p: Option<&str>| {
-            p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        };
-        let mut parts = v.splitn(3, '.');
-        let ok = numeric(parts.next())
-            && numeric(parts.next())
-            && parts
-                .next()
-                .is_some_and(|p| p.starts_with(|ch: char| ch.is_ascii_digit()));
+        // semver `1.2.3[-pre][+build]`: git checkouts are `<name>-<hash>`, which is no version
+        let core: Vec<&str> = v.split(['-', '+']).next()?.split('.').collect();
+        let ok = core.len() == 3 && core.iter().all(|n| n.parse::<u64>().is_ok());
         ok.then(|| v.to_owned())
     })
 }
@@ -247,197 +232,4 @@ pub(crate) fn parse_le_hex(h: &str) -> Option<u64> {
         *byte = u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()?;
     }
     Some(u64::from_le_bytes(b))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dep_info_first_dependency() {
-        assert_eq!(
-            first_dependency("/t/deps/app-1.d: app/src/main.rs Cargo.toml\n\napp/src/main.rs:\n")
-                .as_deref(),
-            Some("app/src/main.rs")
-        );
-        #[cfg(not(windows))] // a backslash is a path separator there, not an escape
-        assert_eq!(
-            first_dependency("/t/x: /a\\ b/lib.rs /c.rs").as_deref(),
-            Some("/a b/lib.rs")
-        );
-        assert_eq!(
-            first_dependency_with("C:\\t\\x.d: C:\\ws\\src\\main.rs C:\\ws\\Cargo.toml", false)
-                .as_deref(),
-            Some("C:\\ws\\src\\main.rs")
-        );
-        assert_eq!(
-            first_dependency_with("/t/x: /a\\ b/lib.rs /c.rs", true).as_deref(),
-            Some("/a b/lib.rs")
-        );
-        assert_eq!(first_dependency("/t/x:"), None);
-        assert_eq!(
-            first_dependency("/t/x:  a.rs b.rs").as_deref(),
-            Some("a.rs")
-        );
-        assert_eq!(first_dependency("/t/x:   ").as_deref(), None);
-    }
-
-    #[test]
-    fn removed_target_by_dep_info() {
-        let fx = crate::testutil::Fx::new("fp-removed");
-        let root = fx.root.join("ws");
-        fs::create_dir_all(root.join("app/src")).unwrap();
-        fs::write(root.join("app/src/main.rs"), "").unwrap();
-        let ws = Workspace {
-            roots: vec![fx.root.join("other"), root.clone()],
-            locals: HashSet::new(),
-            versions: HashMap::new(),
-            lock_changed: None,
-        };
-        let d = fx.root.join("x.d");
-        fs::write(&d, "/t/x.d: app/src/main.rs\n").unwrap();
-        assert!(!ws.target_removed(&d));
-        fs::write(&d, "/t/x.d: app/src/old.rs\n").unwrap();
-        assert!(ws.target_removed(&d));
-        fs::write(
-            &d,
-            format!("/t/x.d: {}\n", root.join("app/src/main.rs").display()),
-        )
-        .unwrap();
-        assert!(!ws.target_removed(&d), "absolute path");
-        assert!(!ws.target_removed(&fx.root.join("missing.d")));
-    }
-
-    #[test]
-    fn workspaces_of_a_profile() {
-        let fx = crate::testutil::Fx::new("fp-ws");
-        fx.lockfile(&["app"], &["serde"]);
-        let other = fx.root.join("elsewhere/proj");
-        fs::create_dir_all(other.join("pkg")).unwrap();
-        fs::write(
-            other.join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"tool\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"serde\"\nversion = \"2.0.0\"\nsource = \"registry+x\"\n",
-        )
-        .unwrap();
-        let state = fx.prof.join(STATE_DIR);
-        fs::create_dir_all(&state).unwrap();
-        fs::write(
-            state.join(UNITS_FILE),
-            format!(
-                "{a}\t{p}\n{b}\t{p}\nbad line\n{a}\t{r}\n",
-                a = crate::testutil::A,
-                b = crate::testutil::B,
-                p = other.join("pkg").display(),
-                r = fx.root.display()
-            ),
-        )
-        .unwrap();
-        let rec = recorded_units(&fx.prof);
-        assert_eq!(rec.len(), 2);
-        assert_eq!(rec[crate::testutil::A], fx.root, "last record wins");
-        let (ws, homes) = workspace(&fx.prof);
-        let ws = ws.unwrap();
-        assert_eq!(ws.roots, [fx.root.clone(), other.clone()]);
-        assert!(ws.is_local("app") && ws.is_local("tool") && !ws.is_local("serde"));
-        let mut v: Vec<&String> = ws.versions["serde"].iter().collect();
-        v.sort();
-        assert_eq!(v, ["1.0.0", "2.0.0"]);
-        assert_eq!(ws.versions.len(), 1);
-        assert_eq!(homes[crate::testutil::B], other);
-        assert!(ws.lock_changed.is_some());
-    }
-
-    #[test]
-    fn sibling_profiles_dep_values() {
-        let fx = crate::testutil::Fx::new("fp-sibling");
-        fx.node("own", crate::testutil::A, 0, 1, 10, &[11]);
-        let rel = fx.root.join("target/release");
-        fs::create_dir_all(rel.join(".fingerprint/x-cccccccccccccccc")).unwrap();
-        fs::write(rel.join(".cargo-lock"), "").unwrap();
-        fs::write(
-            rel.join(".fingerprint/x-cccccccccccccccc/lib-x.json"),
-            r#"{"rustc":1,"deps":[[1,"a",false,21],[2,"b",false,22]],"local":[]}"#,
-        )
-        .unwrap();
-        fs::write(rel.join(".fingerprint/x-cccccccccccccccc/lib-x"), "ffff").unwrap();
-        let mut v = sibling_dep_values(&fx.prof);
-        v.sort();
-        assert_eq!(v, [21, 22]);
-        assert!(sibling_dep_values(&std::env::temp_dir().join("no-such-autoprune")).is_empty());
-    }
-
-    #[test]
-    fn signature_ignores_deps_but_keeps_variant_fields() {
-        let a = r#"{"rustc":1,"features":"[\"x\"]","declared_features":"[]","target":5,"profile":7,"path":9,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"a-1/dep"}}],"rustflags":[],"config":3,"compile_kind":0}"#;
-        let b = a
-            .replace("\"deps\":[]", "\"deps\":[[1,\"d\",false,2]]")
-            .replace("a-1/dep", "a-2/dep");
-        assert_eq!(json_signature(a), json_signature(&b));
-        for (from, to) in [
-            ("[\\\"x\\\"]", "[]"),
-            ("\"profile\":7", "\"profile\":8"),
-            ("\"rustflags\":[]", "\"rustflags\":[\"-Cx\"]"),
-        ] {
-            assert_ne!(
-                json_signature(a),
-                json_signature(&a.replace(from, to)),
-                "{from}"
-            );
-        }
-    }
-
-    #[test]
-    fn version_from_source_path() {
-        let d = std::env::temp_dir().join(format!("autoprune-ver-{}", std::process::id()));
-        fs::create_dir_all(&d).unwrap();
-        let f = d.join("x.d");
-        fs::write(&f, "/t/x.d: /h/registry/src/idx/memchr-2.8.2/src/lib.rs\n").unwrap();
-        assert_eq!(source_version(&f, "memchr").as_deref(), Some("2.8.2"));
-        fs::write(
-            &f,
-            "/t/x.d: /h/git/checkouts/dep_g-63d23441bb5565a0/abc1234/src/lib.rs\n",
-        )
-        .unwrap();
-        assert_eq!(source_version(&f, "dep_g"), None);
-        for bad in [
-            "memchr-.8.2",
-            "memchr-2.x.3",
-            "memchr-x.1.2",
-            "memchr-1.2.x",
-            "memchr-1.2",
-        ] {
-            fs::write(
-                &f,
-                format!("/t/x.d: /h/registry/src/idx/{bad}/src/lib.rs\n"),
-            )
-            .unwrap();
-            assert_eq!(source_version(&f, "memchr"), None, "{bad}");
-        }
-        fs::write(
-            &f,
-            "/t/x.d: /h/registry/src/idx/proc-macro2-1.0.95-rc.1/src/lib.rs\n",
-        )
-        .unwrap();
-        assert_eq!(
-            source_version(&f, "proc-macro2").as_deref(),
-            Some("1.0.95-rc.1")
-        );
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn fingerprint_json_parsing() {
-        let j = r#"{"rustc":139,"features":"[]","deps":[[13,"build_script_build",false,49],[49,"util",false,15]],"local":[{"CheckDepInfo":{"dep_info":"x","checksum":false}}]}"#;
-        assert_eq!(parse_fingerprint_json(j), (139, vec![49, 15]));
-        assert_eq!(
-            parse_fingerprint_json(r#"{"rustc":1,"deps":[],"local":[]}"#),
-            (1, vec![])
-        );
-        assert_eq!(
-            parse_fingerprint_json(r#"{"deps":[[7],[8]]}"#),
-            (0, vec![7, 8])
-        );
-        assert_eq!(parse_le_hex("d5dd8855943b3fe2"), Some(16302814684380716501));
-        assert_eq!(parse_le_hex("xyz"), None);
-    }
 }

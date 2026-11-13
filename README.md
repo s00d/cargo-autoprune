@@ -348,12 +348,30 @@ grown by about 5 GB per step.
 ## Tests
 
 ```bash
-cargo test                      # fast: 35 unit + 13 end-to-end tests (~15 s)
-cargo test -- --include-ignored # all 71: the slow multi-step scenarios too (CI runs these)
-python3 scripts/bench-tree.py /tmp/bench && CARGO_AUTOPRUNE_TRACE=1 cargo autoprune --dry-run /tmp/bench
+cargo test                      # fast: model, stories, fast end-to-end tests (~30 s)
+cargo test -- --include-ignored # also the slow real-cargo scenarios (CI runs these)
+PROPTEST_CASES=600 cargo test --test model   # a longer model run
+TMPDIR=$PWD/target/tmp cargo mutants   # mutation testing, locally only (see .cargo/mutants.toml)
+python3 scripts/bench-tree.py target/tmp/bench && CARGO_AUTOPRUNE_TRACE=1 cargo autoprune --dry-run target/tmp/bench
 scripts/self-test.sh            # self-cleaning on this crate
 scripts/churn-test.sh           # real crates.io crates vs oracle (needs them in ~/.cargo/registry)
 ```
+
+Everything is tested through the public entry points: the `prune` API and the binary (manual
+runs, `status`, the wrapper). No unit tests of single functions.
+
+- `tests/model.rs`: random developer sessions on a simulated cargo (`tests/support/sim.rs`: a
+  workspace built into a real target dir with cargo's file layout, on a virtual clock). Builds in
+  every mode, edits, dependency bumps and reverts, feature-unification flips, toolchain switches,
+  the build-dir layout upgrade, removed targets, crashed builds, waiting, prunes with and without a
+  cap. After every prune: the dry run predicts the real one, freed bytes match the disk, no unit is
+  half deleted, crash debris goes, foreign files stay, what the last build wrote stays, dependencies
+  of kept units stay, the cap holds and evicts the oldest, a second prune finds nothing. At the
+  end, a month of only the current configuration leaves exactly its units. A failure is shrunk to
+  the shortest session and printed.
+- `tests/rules.rs`, `concurrency.rs`, `cli.rs`, `wrapper.rs`: one story per behaviour, written as
+  Given/When/Then: exact thresholds, pins, locks and batches, every CLI option and `status` line,
+  the wrapper's records, tags, interval and notices.
 
 The end-to-end suite (`tests/e2e.rs`, harness in `tests/support/`) needs no network. It builds a
 throwaway workspace against a vendored `directory` registry: two versions of a crate, a crate with a

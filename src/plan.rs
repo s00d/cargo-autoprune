@@ -13,6 +13,7 @@
 //!   a sibling profile dir) through the `deps` edges of `.fingerprint/*/*.json`; each edge names
 //!   the dependency's fingerprint value, the hex in the sibling file.
 //! - A rustc hash with no writes for `RUSTC_RETIRE` before the newest unit (old toolchain) goes.
+//!   Its last write is remembered (`seen`), so deleting its newest units does not age it.
 //! - Without a `Cargo.lock` every unit is grouped like a workspace unit.
 
 use crate::fingerprint::Workspace;
@@ -51,6 +52,7 @@ pub(crate) fn plan(
     units: BTreeMap<String, Unit>,
     incremental: Incremental,
     pinned: &HashMap<String, SystemTime>,
+    seen: &HashMap<String, SystemTime>,
     ws: Option<&Workspace>,
     extra_roots: Vec<u64>,
     cfg: &Config,
@@ -69,9 +71,12 @@ pub(crate) fn plan(
             *e = (*e).max(t);
         }
     }
-    let retired = |u: &Unit| match (newest_all, rustc_newest.get(&u.rustc)) {
-        (Some(n), Some(&r)) => r + RUSTC_RETIRE < n,
-        _ => false,
+    let retired = |u: &Unit| {
+        let last = rustc_newest
+            .get(&u.rustc)
+            .copied()
+            .max(seen.get(&format!("rustc {}", u.rustc)).copied());
+        matches!((newest_all, last), (Some(n), Some(r)) if r + RUSTC_RETIRE < n)
     };
     // After a cargo upgrade to the new build-dir layout the legacy units are dead once nothing
     // wrote them for LAYOUT_RETIRE longer than the new ones (an old cargo still in use writes them).
@@ -82,8 +87,9 @@ pub(crate) fn plan(
             .filter_map(|u| u.mtime)
             .max()
     };
+    let legacy = newest_of(false).map(|l| l.max(seen.get("legacy").copied().unwrap_or(l)));
     let legacy_dead =
-        matches!((newest_of(false), newest_of(true)), (Some(l), Some(n)) if l + LAYOUT_RETIRE < n);
+        matches!((legacy, newest_of(true)), (Some(l), Some(n)) if l + LAYOUT_RETIRE < n);
 
     // Build-script *run* units never reach rustc, so they inherit the clippy tag of the compiled
     // build script they depend on.
@@ -112,7 +118,8 @@ pub(crate) fn plan(
     let mut registry: Vec<(Candidate, Option<u64>, Vec<u64>)> = Vec::new();
     for (h, u) in units {
         let is_dead = dead.contains(&h);
-        let local = ws.is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or("")));
+        // an orphan has no package name: its file stem is the crate name
+        let local = ws.is_none_or(|w| w.is_local(u.name.as_deref().unwrap_or(&u.stem)));
         let c = Candidate {
             krate: if local { u.krate.clone() } else { None }, // only workspace crates are incremental
             id: h,
@@ -378,7 +385,9 @@ pub(crate) fn apply_cap(
 ) -> Vec<Candidate> {
     let Some(cap) = cap else { return doomed };
     let mut total: u64 = kept.iter().flat_map(|c| &c.paths).map(|p| size_of(p)).sum();
-    kept.sort_by_key(|c| (c.mtime, !c.incremental));
+    // ties (one build writes many units in the same second) broken by id: a dry run then names
+    // exactly what the real run deletes
+    kept.sort_by(|a, b| (a.mtime, !a.incremental, &a.id).cmp(&(b.mtime, !b.incremental, &b.id)));
     for c in kept {
         if total <= cap {
             break;

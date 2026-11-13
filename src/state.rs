@@ -58,6 +58,13 @@ pub(crate) fn clean_tags(tags: &Path, profile: &Path) {
 }
 
 pub(crate) fn read_pins(p: &Path, now: SystemTime) -> HashMap<String, SystemTime> {
+    let mut pins = read_times(p);
+    pins.retain(|_, t| t.checked_add(PIN_TTL).is_some_and(|end| end > now));
+    pins
+}
+
+/// `key\tunix_ts` lines (pins, suspects, last writes).
+pub(crate) fn read_times(p: &Path) -> HashMap<String, SystemTime> {
     fs::read_to_string(p)
         .unwrap_or_default()
         .lines()
@@ -65,7 +72,7 @@ pub(crate) fn read_pins(p: &Path, now: SystemTime) -> HashMap<String, SystemTime
             let (k, ts) = l.rsplit_once('\t')?;
             // checked: a corrupt timestamp must not panic every background prune
             let t = UNIX_EPOCH.checked_add(Duration::from_secs(ts.parse().ok()?))?;
-            (t.checked_add(PIN_TTL)? > now).then(|| (k.to_owned(), t))
+            Some((k.to_owned(), t))
         })
         .collect()
 }
@@ -157,197 +164,4 @@ pub(crate) fn notices_for(profile: &Path, r: &Report) -> Vec<String> {
         ));
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[test]
-    fn notices_for_big_frees_errors_and_long_locks() {
-        let p = Path::new("/t/debug");
-        let mut r = Report::default();
-        assert!(notices_for(p, &r).is_empty(), "a normal prune is silent");
-        r.freed_bytes = 3 << 30;
-        r.by_reason.insert("superseded", 7);
-        r.errors.push("/t/debug/deps/x: Permission denied".into());
-        r.locked = Duration::from_secs(9);
-        let n = notices_for(p, &r);
-        assert_eq!(n.len(), 3, "{n:?}");
-        assert!(n[0].contains("could not delete 1 path(s)"));
-        assert!(n[1].contains("freed 3.0GiB") && n[1].contains("superseded 7"));
-        assert!(n[2].contains("9 s"));
-    }
-
-    fn tmp(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("autoprune-state-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn pins_and_deletions_expire_after_a_day() {
-        let d = tmp("ttl");
-        let now = SystemTime::now();
-        let ago = |h: u64| {
-            (now - Duration::from_secs(h * 3600))
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        };
-        fs::write(
-            d.join("pinned"),
-            format!("a|1\t{}\nb|2\t{}\nbroken\n", ago(2), ago(25)),
-        )
-        .unwrap();
-        let pins = read_pins(&d.join("pinned"), now);
-        assert_eq!(pins.keys().collect::<Vec<_>>(), ["a|1"]);
-        write_pins(&d.join("pinned2"), &pins).unwrap();
-        assert_eq!(
-            fs::read_to_string(d.join("pinned2")).unwrap(),
-            format!("a|1\t{}\n", ago(2))
-        );
-
-        fs::write(
-            d.join("deleted"),
-            format!(
-                "x\t{}\tL1\ny\t{}\tL2\nz\t{}\nbad\tts\n",
-                ago(2),
-                ago(25),
-                ago(1)
-            ),
-        )
-        .unwrap();
-        let del = read_deleted(&d.join("deleted"), now);
-        assert_eq!(del.len(), 2, "{del:?}");
-        assert_eq!(del["x"], (ago(2), "L1".to_owned()));
-        assert_eq!(del["z"], (ago(1), String::new()));
-        write_deleted(&d.join("deleted2"), &del).unwrap();
-        assert_eq!(read_deleted(&d.join("deleted2"), now), del);
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn expiry_at_exactly_one_day() {
-        let d = tmp("edge");
-        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let day_ago = 1_800_000_000 - 24 * 3600;
-        fs::write(
-            d.join("pinned"),
-            format!("gone\t{day_ago}\nlive\t{}\n", day_ago + 1),
-        )
-        .unwrap();
-        assert_eq!(
-            read_pins(&d.join("pinned"), now).keys().collect::<Vec<_>>(),
-            ["live"]
-        );
-        fs::write(
-            d.join("deleted"),
-            format!("kept\t{day_ago}\ngone\t{}\n", day_ago - 1),
-        )
-        .unwrap();
-        assert_eq!(
-            read_deleted(&d.join("deleted"), now)
-                .keys()
-                .collect::<Vec<_>>(),
-            ["kept"]
-        );
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn log_lines_and_rotation() {
-        let d = tmp("log");
-        let mut r = Report {
-            removed_units: 3,
-            removed_incremental: 1,
-            freed_bytes: 2048,
-            ..Report::default()
-        };
-        r.by_reason.insert("orphan", 3);
-        log(&d.join("log"), &r);
-        let line = fs::read_to_string(d.join("log")).unwrap();
-        assert!(line.ends_with("units=3 incremental=1 freed=2.0KiB pinned=0 took=0ms locked=0ms errors=0 [orphan 3]\n"), "{line}");
-        fs::write(d.join("log"), vec![b'x'; 256 * 1024]).unwrap();
-        log(&d.join("log"), &r);
-        assert_eq!(
-            fs::metadata(d.join("log")).unwrap().len() as usize,
-            256 * 1024 + line.len(),
-            "not rotated at the limit"
-        );
-        fs::write(d.join("log"), vec![b'x'; 256 * 1024 + 1]).unwrap();
-        log(&d.join("log"), &r);
-        assert_eq!(
-            fs::metadata(d.join("log.old")).unwrap().len(),
-            256 * 1024 + 1
-        );
-        assert_eq!(fs::read_to_string(d.join("log")).unwrap().len(), line.len());
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn notice_thresholds() {
-        let p = Path::new("/t/debug");
-        let r = Report {
-            freed_bytes: (1 << 30) - 1,
-            locked: Duration::from_millis(4999),
-            ..Report::default()
-        };
-        assert!(notices_for(p, &r).is_empty());
-        let r = Report {
-            freed_bytes: 1 << 30,
-            locked: Duration::from_secs(5),
-            ..Report::default()
-        };
-        assert_eq!(notices_for(p, &r).len(), 2);
-    }
-
-    #[test]
-    fn stale_tags_are_dropped() {
-        let fx = crate::testutil::Fx::new("state-tags");
-        fx.lib("app", crate::testutil::A, 0, false);
-        let tags = fx.prof.join("tags");
-        fs::create_dir_all(&tags).unwrap();
-        fs::write(tags.join(crate::testutil::A), "clippy-driver").unwrap();
-        fs::write(tags.join(crate::testutil::B), "clippy-driver").unwrap();
-        clean_tags(&tags, &fx.prof);
-        assert!(tags.join(crate::testutil::A).exists() && !tags.join(crate::testutil::B).exists());
-    }
-
-    #[test]
-    fn corrupt_pin_timestamps_are_ignored() {
-        let d = std::env::temp_dir().join(format!("autoprune-pins-{}", std::process::id()));
-        fs::create_dir_all(&d).unwrap();
-        let f = d.join("pinned");
-        fs::write(
-            &f,
-            format!("a|b\t{}\nc|d\tnot-a-number\ne|f\t42\n", u64::MAX),
-        )
-        .unwrap();
-        assert!(read_pins(&f, SystemTime::now()).is_empty());
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn notice_file_is_capped() {
-        let d = std::env::temp_dir().join(format!("autoprune-notice-{}", std::process::id()));
-        fs::create_dir_all(&d).unwrap();
-        for i in 0..1000 {
-            add_notice(&d, &format!("message number {i}"));
-        }
-        let len = fs::metadata(d.join(NOTICE_FILE)).unwrap().len();
-        assert!(
-            len > MAX_NOTICE_BYTES && len < MAX_NOTICE_BYTES + 100,
-            "{len}"
-        );
-        assert_eq!(read_notices(&d)[0], "message number 0");
-        let mut full = vec![b'x'; MAX_NOTICE_BYTES as usize];
-        full[MAX_NOTICE_BYTES as usize - 1] = b'\n';
-        fs::write(d.join(NOTICE_FILE), full).unwrap();
-        add_notice(&d, "at the limit");
-        assert_eq!(read_notices(&d).last().unwrap(), "at the limit");
-        let _ = fs::remove_dir_all(&d);
-    }
 }

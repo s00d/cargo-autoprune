@@ -3,7 +3,7 @@
 # After each step, compare the auto-pruned target/ with an oracle target built from scratch with
 # the same commands: "left" = garbage autoprune kept, "lost" = live files it removed (must be 0).
 set -u
-W=${CHURN_DIR:-${TMPDIR:-/tmp}/cargo-autoprune-churn}; L=$W/logs; mkdir -p $L; cd $W || exit 1
+W=${CHURN_DIR:-${0:A:h:h}/target/tmp/churn}; L=$W/logs; mkdir -p $L; cd $W || exit 1
 # needs the pinned crate versions below in ~/.cargo/registry (runs --offline)
 rm -rf target target-oracle app util Cargo.toml Cargo.lock $L/*
 mkdir -p app/src app/tests app/examples util/src

@@ -1,7 +1,7 @@
 //! `cargo autoprune [--dry-run] [--max-size SIZE] [--grace SECS] [DIR]`.
 
 use crate::fsutil::{entries, human, parse_size, size_of};
-use crate::layout::{find_target_dirs, is_profile_dir, profile_dirs, STATE_DIR};
+use crate::layout::{find_target_dirs, fingerprint_dirs, is_profile_dir, profile_dirs, STATE_DIR};
 use crate::prune::{prune, Config, Outcome};
 use crate::state::read_notices;
 use std::env;
@@ -63,12 +63,19 @@ fn resolve_profiles(dir: Option<PathBuf>) -> Vec<PathBuf> {
 }
 
 /// `--remove-idle DAYS`: delete a whole target dir when nothing was compiled into it for DAYS
-/// (newest fingerprint dir). Skipped while any of its profiles is locked by a running cargo.
+/// (the newest build of a unit, or the wrapper's stamp). Not the log or the fingerprint dir: a
+/// prune writes those, and a nightly `-r --remove-idle` would never see a target idle.
+/// Skipped while any of its profiles is locked by a running cargo.
 fn remove_if_idle(target: &std::path::Path, days: u64, dry_run: bool) -> bool {
     let profiles = profile_dirs(target);
     let newest = profiles
         .iter()
-        .flat_map(|p| [p.join(".fingerprint"), p.join(".autoprune").join("log")])
+        .flat_map(|p| {
+            fingerprint_dirs(p)
+                .into_iter()
+                .map(|f| f.join("invoked.timestamp"))
+                .chain([p.join(STATE_DIR).join("stamp")])
+        })
         .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
         .max();
     let idle = newest
@@ -145,6 +152,19 @@ fn bad_env(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
 
 /// `cargo autoprune status [DIR]`: size, reclaimable space, last prune, pins, notices, setup.
 fn status(dir: Option<PathBuf>, out: &mut dyn Write) -> io::Result<()> {
+    status_at(dir, std::time::SystemTime::now(), out)
+}
+
+/// `status` as of `now` (tests pass a fixed clock).
+#[doc(hidden)]
+pub fn status_at(
+    dir: Option<PathBuf>,
+    now: std::time::SystemTime,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let now = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     let wrapper = configured_wrapper(|k| env::var_os(k), env::current_dir().ok());
     writeln!(out, "wrapper: {}", wrapper.as_deref().unwrap_or("not configured (add build.rustc-wrapper = \"cargo-autoprune\" to ~/.cargo/config.toml)"))?;
     for w in bad_env(|k| env::var(k).ok()) {
@@ -183,7 +203,7 @@ fn status(dir: Option<PathBuf>, out: &mut dyn Write) -> io::Result<()> {
         let log = fs::read_to_string(state.join("log")).unwrap_or_default();
         match log.lines().last().and_then(|l| l.split_once(' ')) {
             Some((ts, rest)) => {
-                let ago = now_secs().saturating_sub(ts.parse().unwrap_or(0));
+                let ago = now.saturating_sub(ts.parse().unwrap_or(0));
                 writeln!(out, "  last prune: {} ago, {rest}", ago_text(ago))?;
             }
             None => writeln!(out, "  last prune: never")?,
@@ -241,12 +261,6 @@ fn ago_text(secs: u64) -> String {
         s if s < 172_800 => format!("{} h", s / 3600),
         s => format!("{} days", s / 86400),
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 /// A manual run's options.
@@ -443,363 +457,4 @@ fn print_report(
 fn die(msg: &str) -> ! {
     eprintln!("cargo-autoprune: {msg}");
     std::process::exit(2)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::testutil::{set_age, Fx};
-    use std::ffi::OsString;
-
-    fn parse(args: &[&str]) -> Result<Cmd, String> {
-        parse_args(&args.iter().map(OsString::from).collect::<Vec<_>>())
-    }
-    fn opts(args: &[&str]) -> Opts {
-        match parse(args) {
-            Ok(Cmd::Prune(o)) => o,
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn options_parse() {
-        let o = opts(&[]);
-        assert!(!o.cfg.dry_run && !o.verbose && !o.recursive && !o.cfg.drop_incremental);
-        assert_eq!((o.cfg.max_size, o.remove_idle), (None, None));
-        assert_eq!(o.cfg.lock_wait, Duration::from_secs(600));
-        let o = opts(&["-n", "-v", "-r", "--drop-incremental", "--max-size", "2G"]);
-        assert!(o.cfg.dry_run && o.verbose && o.recursive && o.cfg.drop_incremental);
-        assert_eq!(o.cfg.max_size, Some(2 << 30));
-        let o = opts(&[
-            "--dry-run",
-            "--verbose",
-            "--recursive",
-            "a",
-            "--grace",
-            "5",
-            "b",
-        ]);
-        assert!(o.cfg.dry_run && o.verbose && o.recursive);
-        assert_eq!(o.cfg.grace, Duration::from_secs(5));
-        assert_eq!(o.dirs, [PathBuf::from("a"), PathBuf::from("b")]);
-        let o = opts(&["--grace", "9", "--ci", "--remove-idle", "30"]);
-        assert_eq!(o.cfg.grace, Duration::ZERO);
-        assert!(o.cfg.drop_incremental);
-        assert_eq!(o.remove_idle, Some(30));
-    }
-
-    #[test]
-    fn commands_and_bad_options() {
-        assert!(matches!(parse(&["-h"]), Ok(Cmd::Help)));
-        assert!(matches!(parse(&["x", "--help"]), Ok(Cmd::Help)));
-        assert!(matches!(parse(&["-V"]), Ok(Cmd::Version)));
-        assert!(matches!(parse(&["--version"]), Ok(Cmd::Version)));
-        assert!(matches!(parse(&["status"]), Ok(Cmd::Status(None))));
-        assert!(
-            matches!(parse(&["status", "d"]), Ok(Cmd::Status(Some(d))) if d.as_os_str() == "d")
-        );
-        assert!(parse(&["--bogus"])
-            .unwrap_err()
-            .starts_with("unknown option --bogus"));
-        assert!(parse(&["--max-size", "20"])
-            .unwrap_err()
-            .contains("below 1 MiB"));
-        assert!(parse(&["--grace", "x"])
-            .unwrap_err()
-            .contains("--grace takes seconds"));
-        assert!(parse(&["--remove-idle"])
-            .unwrap_err()
-            .contains("takes days"));
-    }
-
-    #[test]
-    fn ago_text_units() {
-        let cases = [
-            (0, "0 s"),
-            (119, "119 s"),
-            (120, "2 min"),
-            (7199, "119 min"),
-            (7200, "2 h"),
-            (172_799, "47 h"),
-            (172_800, "2 days"),
-        ];
-        for (s, t) in cases {
-            assert_eq!(ago_text(s), t, "{s}");
-        }
-        assert!(now_secs() > 1_700_000_000);
-    }
-
-    #[test]
-    fn bad_env_lists_unparsable_settings() {
-        fn env(pairs: &[(&str, &str)]) -> Vec<String> {
-            bad_env(|k| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string()))
-        }
-        assert!(env(&[]).is_empty());
-        let ok = [
-            ("CARGO_AUTOPRUNE_INTERVAL", " 60 "),
-            ("CARGO_AUTOPRUNE_GRACE", "0"),
-            ("CARGO_AUTOPRUNE_MAX_SIZE", "1G"),
-        ];
-        assert!(env(&ok).is_empty());
-        let bad = env(&[
-            ("CARGO_AUTOPRUNE_INTERVAL", "5m"),
-            ("CARGO_AUTOPRUNE_GRACE", "x"),
-            ("CARGO_AUTOPRUNE_MAX_SIZE", "20"),
-        ]);
-        assert_eq!(bad.len(), 3, "{bad:?}");
-        assert!(bad[0].starts_with("CARGO_AUTOPRUNE_INTERVAL=\"5m\""));
-        assert!(bad[1].starts_with("CARGO_AUTOPRUNE_GRACE=\"x\""));
-        assert!(bad[2].contains("MAX_SIZE ignored"));
-    }
-
-    #[test]
-    fn wrapper_detection() {
-        let fx = Fx::new("cli-wrapper");
-        let home = fx.root.join("home");
-        fs::create_dir_all(home.join(".cargo")).unwrap();
-        let h = home.clone();
-        let detect = |vars: &[(&str, &str)], cwd: Option<PathBuf>| {
-            let vars: Vec<(String, OsString)> = vars
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.to_string(),
-                        OsString::from(v.replace("$H", h.to_str().unwrap())),
-                    )
-                })
-                .collect();
-            configured_wrapper(|k| vars.iter().find(|p| p.0 == k).map(|p| p.1.clone()), cwd)
-        };
-        assert_eq!(
-            detect(&[("RUSTC_WRAPPER", "/bin/cargo-autoprune")], None).as_deref(),
-            Some("RUSTC_WRAPPER=/bin/cargo-autoprune")
-        );
-        assert_eq!(detect(&[], None), None);
-        let cfg_file = home.join(".cargo/config.toml");
-        let found = Some(format!("enabled in {}", cfg_file.display()));
-        for (text, on) in [
-            ("[build]\nrustc-wrapper = \"cargo-autoprune\"\n", true),
-            ("  # rustc-wrapper = \"cargo-autoprune\"\n", false),
-            ("rustc-wrapper = \"sccache\"\n", false),
-            ("x = \"cargo-autoprune\"\n", false),
-        ] {
-            fs::write(&cfg_file, text).unwrap();
-            let want = if on { found.clone() } else { None };
-            assert_eq!(
-                detect(&[("HOME", "$H"), ("RUSTC_WRAPPER", "sccache")], None),
-                want,
-                "{text}"
-            );
-            let cargo_home = &[("CARGO_HOME", "$H/.cargo")];
-            assert_eq!(detect(cargo_home, None), want, "{text}");
-        }
-        fs::remove_file(&cfg_file).unwrap();
-        // a project config above the working dir
-        let proj = fx.root.join("proj");
-        fs::create_dir_all(proj.join(".cargo")).unwrap();
-        fs::create_dir_all(proj.join("sub")).unwrap();
-        fs::write(
-            proj.join(".cargo/config.toml"),
-            "rustc-wrapper = \"cargo-autoprune\"",
-        )
-        .unwrap();
-        assert_eq!(
-            detect(&[("HOME", "$H")], Some(proj.join("sub"))),
-            Some(format!(
-                "enabled in {}",
-                proj.join(".cargo/config.toml").display()
-            ))
-        );
-    }
-
-    fn status_text(fx: &Fx) -> String {
-        let mut out = Vec::new();
-        status(Some(fx.prof.clone()), &mut out).unwrap();
-        String::from_utf8(out).unwrap()
-    }
-
-    #[test]
-    fn status_reports_prune_log_and_pins() {
-        let fx = Fx::new("cli-status");
-        fx.lib("foo", crate::testutil::A, 7200, false);
-        fx.lib("foo", crate::testutil::B, 0, false);
-        let s = status_text(&fx);
-        assert!(s.contains("2 units"), "{s}");
-        assert!(
-            s.contains("reclaimable now: ")
-                && s.contains("(1 units, 0 incremental dirs: superseded 1)"),
-            "{s}"
-        );
-        assert!(s.contains("last prune: never"), "{s}");
-        assert!(!s.contains("pinned groups"), "{s}");
-        assert!(
-            fx.exists("deps/libfoo-aaaaaaaaaaaaaaaa.rlib"),
-            "status is a dry run"
-        );
-        let state = fx.prof.join(STATE_DIR);
-        fs::create_dir_all(&state).unwrap();
-        fs::write(
-            state.join("log"),
-            format!("1 old\n{} removed 3 units\n", now_secs() - 300),
-        )
-        .unwrap();
-        fs::write(state.join("pinned"), "foo|lib|x 1\nbar|lib|y 2\n").unwrap();
-        let s = status_text(&fx);
-        assert!(s.contains("last prune: 5 min ago, removed 3 units"), "{s}");
-        assert!(
-            s.contains("pinned groups (alternating variants, 24 h): foo, bar"),
-            "{s}"
-        );
-    }
-
-    #[test]
-    fn status_does_not_wait_for_a_running_build() {
-        let fx = Fx::new("cli-status-busy");
-        let _held = crate::lock::acquire_cargo_locks(&fx.prof, Duration::ZERO)
-            .unwrap()
-            .unwrap();
-        let s = status_text(&fx);
-        assert!(s.contains("reclaimable now: unknown"), "{s}");
-    }
-
-    #[test]
-    fn idle_target_dirs() {
-        let fx = Fx::new("cli-idle");
-        let target = fx.root.join("target");
-        set_age(&fx.prof.join(".fingerprint"), 36 * 3600);
-        assert!(
-            !remove_if_idle(&target, 2, true),
-            "1.5 days old, 2 required"
-        );
-        assert!(remove_if_idle(&target, 1, true));
-        assert!(target.exists(), "dry run");
-        // a running cargo keeps it
-        let held = crate::lock::acquire_cargo_locks(&fx.prof, Duration::ZERO).unwrap();
-        assert!(!remove_if_idle(&target, 1, false));
-        drop(held);
-        assert!(remove_if_idle(&target, 1, false));
-        assert!(!target.exists());
-    }
-
-    #[test]
-    fn profiles_of_a_dir_argument() {
-        let fx = Fx::new("cli-resolve");
-        let want = vec![fx.prof.clone()];
-        assert_eq!(resolve_profiles(Some(fx.prof.clone())), want, "profile dir");
-        assert_eq!(
-            resolve_profiles(Some(fx.root.join("target"))),
-            want,
-            "target dir"
-        );
-        assert_eq!(resolve_profiles(Some(fx.root.clone())), want, "project dir");
-    }
-
-    fn report_text(
-        r: &crate::prune::Report,
-        dry: bool,
-        verbose: bool,
-        trace: bool,
-    ) -> (String, String) {
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        print_report(
-            &mut out,
-            &mut err,
-            std::path::Path::new("/t/debug"),
-            r,
-            dry,
-            verbose,
-            trace,
-        )
-        .unwrap();
-        (
-            String::from_utf8(out).unwrap(),
-            String::from_utf8(err).unwrap(),
-        )
-    }
-
-    #[test]
-    fn manual_run_report() {
-        let mut r = crate::prune::Report {
-            removed_units: 2,
-            removed_incremental: 1,
-            freed_bytes: 2048,
-            elapsed: Duration::from_millis(7),
-            locked: Duration::from_millis(3),
-            phases: vec![("plan", Duration::from_micros(1500))],
-            removed: vec![PathBuf::from("/t/debug/deps/x")],
-            ..Default::default()
-        };
-        let (out, err) = report_text(&r, false, false, false);
-        assert_eq!(
-            out,
-            "/t/debug: removed 2 units, 1 incremental dirs, 2.0KiB (7 ms, cargo blocked 3 ms)\n"
-        );
-        assert!(err.is_empty());
-        let (out, _) = report_text(&r, true, false, false);
-        assert_eq!(out, "  /t/debug/deps/x\n/t/debug: would remove 2 units, 1 incremental dirs, 2.0KiB (7 ms, cargo blocked 3 ms)\n");
-        let (out, _) = report_text(&r, false, true, false);
-        assert!(
-            out.starts_with("  /t/debug/deps/x\n") && !out.contains(" ms  plan"),
-            "{out}"
-        );
-        let (out, _) = report_text(&r, false, false, true);
-        assert!(
-            out.starts_with("       1.5 ms  plan\n/t/debug: removed"),
-            "{out}"
-        );
-        r.by_reason.insert("orphan", 2);
-        r.pinned_now = vec!["tokio|lib|x".into(), "serde|lib|y".into()];
-        r.errors = (0..7).map(|i| format!("e{i}")).collect();
-        let (out, err) = report_text(&r, false, false, false);
-        assert!(
-            out.ends_with("ms)\n  orphan 2\n  pinned (alternating variants): tokio, serde\n"),
-            "{out}"
-        );
-        assert_eq!(err.lines().count(), 5);
-        assert!(err.starts_with("  warning: could not delete e0\n"));
-    }
-
-    #[test]
-    fn profiles_of_a_manual_run() {
-        let fx = Fx::new("cli-select");
-        let mut out = Vec::new();
-        let target = fx.root.join("target");
-        assert_eq!(
-            select_profiles(vec![fx.root.clone()], false, None, false, &mut out),
-            std::slice::from_ref(&fx.prof)
-        );
-        let two = select_profiles(
-            vec![fx.root.clone(), target.clone()],
-            false,
-            None,
-            false,
-            &mut out,
-        );
-        assert_eq!(two, [fx.prof.clone(), fx.prof.clone()]);
-        assert_eq!(
-            select_profiles(vec![fx.root.clone()], true, None, false, &mut out),
-            std::slice::from_ref(&fx.prof)
-        );
-        assert!(out.is_empty());
-        // idle for 2 days: a dry run keeps the dir but prunes nothing in it
-        set_age(&fx.prof.join(".fingerprint"), 2 * 86400);
-        assert!(select_profiles(vec![fx.root.clone()], true, Some(1), true, &mut out).is_empty());
-        assert_eq!(
-            String::from_utf8(out.clone()).unwrap(),
-            "no Cargo target dirs found\n"
-        );
-        assert!(target.exists());
-        assert_eq!(
-            select_profiles(vec![fx.root.clone()], true, Some(3), true, &mut out),
-            std::slice::from_ref(&fx.prof)
-        );
-    }
-
-    #[test]
-    fn caps_need_a_sane_size() {
-        assert_eq!(parse_cap("20G"), Ok(20 << 30));
-        assert!(parse_cap("20").unwrap_err().contains("below 1 MiB"));
-        assert!(parse_cap("lots").unwrap_err().contains("cannot parse"));
-    }
 }

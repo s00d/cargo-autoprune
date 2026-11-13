@@ -958,7 +958,7 @@ fn cli_accepts_a_directory_without_subcommand() {
 #[test]
 fn no_arguments_is_a_manual_run_of_the_current_project() {
     // no args: the CLI on ./target, not a wrapper call with no rustc to run
-    let dir = std::env::temp_dir().join(format!("cargo-autoprune-noargs-{}", std::process::id()));
+    let dir = support::scratch("noargs");
     fs::create_dir_all(&dir).unwrap();
     let out = Command::new(BIN)
         .current_dir(&dir)
@@ -973,8 +973,7 @@ fn no_arguments_is_a_manual_run_of_the_current_project() {
 #[test]
 fn manual_run_sums_what_every_profile_frees() {
     // a hand-made target: in debug and release, a lib built twice an hour apart (no cargo needed)
-    let root = std::env::temp_dir().join(format!("cargo-autoprune-total-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = support::scratch("total");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     fs::write(
@@ -1128,8 +1127,7 @@ fn background_pruner_closes_inherited_pipes() {
 
 #[test]
 fn background_error_in_a_real_profile_leaves_a_notice() {
-    let root = std::env::temp_dir().join(format!("cargo-autoprune-bgerr-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = support::scratch("bgerr");
     let debug = root.join("target/debug");
     fs::create_dir_all(debug.join(".autoprune/lock")).unwrap(); // the prune's own lock can't open
     fs::write(root.join("target/CACHEDIR.TAG"), "").unwrap();

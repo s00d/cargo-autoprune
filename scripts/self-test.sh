@@ -3,7 +3,7 @@
 set -u
 # runs on a throwaway copy: the package version is changed there (it rehashes every unit, the way
 # a dependency change does) and the repository's own Cargo.toml is never touched
-C=${TMPDIR:-/tmp}/cargo-autoprune-selftest; rm -rf $C; mkdir -p $C
+C=${0:A:h:h}/target/tmp/selftest; rm -rf $C; mkdir -p $C
 cp -R ${0:A:h}/../{Cargo.toml,Cargo.lock,src,tests} $C/ && cd $C
 sz() { /usr/bin/du -sk target | cut -f1; }
 copies() { /bin/ls target/debug/deps | grep -cE '^cargo_autoprune-[0-9a-f]{16}$'; }

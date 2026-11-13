@@ -16,7 +16,4 @@ mod scan;
 pub(crate) mod state;
 pub mod wrapper;
 
-#[cfg(test)]
-mod testutil;
-
 pub use fsutil::{human, parse_size};

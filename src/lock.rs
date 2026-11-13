@@ -45,31 +45,3 @@ pub(crate) fn acquire_cargo_locks(profile: &Path, wait: Duration) -> io::Result<
         std::thread::sleep(Duration::from_millis(500));
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testutil::Fx;
-
-    #[test]
-    fn waits_for_cargo_to_release_its_locks() {
-        let fx = Fx::new("lock-wait");
-        std::fs::write(fx.prof.join(".cargo-build-lock"), "").unwrap();
-        let held = lock_file(&fx.prof.join(".cargo-build-lock")).unwrap();
-        held.lock().unwrap();
-        assert!(acquire_cargo_locks(&fx.prof, Duration::ZERO)
-            .unwrap()
-            .is_none());
-        let t = Instant::now();
-        std::thread::scope(|s| {
-            s.spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                drop(held);
-            });
-            let got = acquire_cargo_locks(&fx.prof, Duration::from_secs(10)).unwrap();
-            assert_eq!(got.map(|l| l.len()), Some(2), "both existing lock files");
-        });
-        assert!(t.elapsed() >= Duration::from_millis(300));
-        assert!(t.elapsed() < Duration::from_secs(5));
-    }
-}

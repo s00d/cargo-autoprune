@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod sim;
+
 use cargo_autoprune::layout::profile_dirs;
 use cargo_autoprune::prune::{prune, Config, Outcome, Report};
 use std::collections::BTreeSet;
@@ -14,6 +16,44 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_cargo-autoprune");
+
+/// `target/tmp/<test crate>/<name>` in the project: test files never land outside it, and a rerun
+/// reuses (not adds) them. Not emptied: see [`scratch`].
+pub fn tmp(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(env!("CARGO_CRATE_NAME"))
+        .join(name)
+}
+
+/// Remove a test's dir, also when a test left a read-only dir in it (the undeletable-files story,
+/// killed before it restored the mode).
+pub fn remove_tree(p: &Path) {
+    if fs::remove_dir_all(p).is_err() && p.exists() {
+        writable(p);
+        let _ = fs::remove_dir_all(p);
+    }
+}
+
+fn writable(p: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if p.is_dir() && !p.is_symlink() {
+            let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+            for e in fs::read_dir(p).into_iter().flatten().flatten() {
+                writable(&e.path());
+            }
+        }
+    }
+}
+
+/// [`tmp`], emptied first.
+pub fn scratch(name: &str) -> PathBuf {
+    let p = tmp(name);
+    remove_tree(&p);
+    fs::create_dir_all(p.parent().unwrap()).unwrap(); // tests running at once share the parent
+    p
+}
 /// A cargo command in a test that runs longer than this is reported with a process dump.
 const CARGO_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -31,9 +71,7 @@ impl Ws {
     /// dep_a 1.0.0/1.1.0, dep_b (build script, depends on dep_a 1), dep_c (`fast` feature),
     /// dep_m (proc-macro).
     pub fn new(name: &str) -> Ws {
-        let root =
-            std::env::temp_dir().join(format!("cargo-autoprune-e2e/{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = scratch(&format!("e2e-{name}"));
         let dir = root.join("ws");
         let ws = Ws {
             target: dir.join("target"),
@@ -322,7 +360,7 @@ impl Ws {
 impl Drop for Ws {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            let _ = fs::remove_dir_all(&self.root);
+            remove_tree(&self.root);
         }
     }
 }
@@ -404,6 +442,21 @@ pub fn age_tree(p: &Path, secs: u64) {
     let Ok(m) = fs::symlink_metadata(p) else {
         return;
     };
+    if p.file_name().is_some_and(|n| n == "seen") {
+        // last writes per toolchain: `key\tunix_ts`, aged with the files
+        let text = fs::read_to_string(p).unwrap_or_default();
+        let aged: String = text
+            .lines()
+            .filter_map(|l| l.rsplit_once('\t'))
+            .map(|(k, t)| {
+                format!(
+                    "{k}\t{}\n",
+                    t.parse::<u64>().unwrap_or(0).saturating_sub(secs)
+                )
+            })
+            .collect();
+        fs::write(p, aged).unwrap();
+    }
     if m.is_dir() {
         for e in fs::read_dir(p).unwrap() {
             age_tree(&e.unwrap().path(), secs);

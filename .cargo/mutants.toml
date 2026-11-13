@@ -1,11 +1,25 @@
-# cargo-mutants (`cargo install --locked cargo-mutants`): `cargo mutants`, or `cargo mutants --in-diff`
-# on a branch. Every mutant is judged by the default suite (unit + e2e; the slow oracle tests stay
-# ignored). Keep the default single job: the e2e tests run real cargo builds on every core.
+# cargo-mutants (`cargo install --locked cargo-mutants`), locally only: `TMPDIR=$PWD/target/tmp
+# cargo mutants -j 1 --test-tool nextest` (its build copies stay in the project), `--iterate` to
+# resume, `--in-diff` on a branch. Every mutant is judged by
+# the default suite: the model, the stories and the fast end-to-end tests. Keep one job: the e2e
+# tests run real cargo builds on every core.
 #
-# Known survivors on macOS/Linux (not excluded, so they stay visible):
-# - prune: `m.is_dir()` guard -> true (files renamed into the trash instead of unlinked) and
-#   `files.len() >= 1000` -> `<` (when a batch of unlinks is flushed): same result, only speed
-# - wait_for_exit: `Instant::now() < deadline` -> `<=`: equal to the nanosecond
-# - no_inherit_std_handles: Windows-only code, compiled out here (Windows CI runs the e2e tests)
+# Not observable in a test (excluded):
+# - par_map_with: how many threads map the items (a threshold for small inputs); the result is
+#   the same list in the same order
+# - parse_fingerprint_json `i + 1`: a deps entry is `[id,"name",bool,fp]`, the fingerprint after
+#   its last comma reads the same whether the slice starts at `[` or after it
+# - prune_at, a doomed file renamed into the trash (as dirs are) instead of unlinked: gone either
+#   way, with the same bytes freed
+# - unlink_batch_full: how many unlinks run together on a few threads
+#
+# Timeouts count as caught: such a mutant hangs (a loop that never ends, `status` waiting for a
+# build's lock).
+exclude_re = [
+    "in par_map_with$",
+    "replace \\+ with \\* in parse_fingerprint_json",
+    "replace match guard m.is_dir\\(\\) with true in prune_at",
+    "unlink_batch_full",
+]
 timeout_multiplier = 3.0
 minimum_test_timeout = 120

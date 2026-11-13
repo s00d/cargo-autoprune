@@ -2,7 +2,7 @@
 
 use crate::fingerprint::{json_signature, parse_fingerprint_json, parse_le_hex};
 use crate::fsutil::{entries, mtime, par_map};
-use crate::layout::{out_kind, split_hash, STATE_DIR, TAGS_DIR};
+use crate::layout::{is_codegen, split_hash, STATE_DIR, TAGS_DIR};
 use crate::prune::Phases;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -14,7 +14,7 @@ pub(crate) struct Unit {
     pub(crate) name: Option<String>, // package name from .fingerprint
     pub(crate) stem: String,         // file stem from deps (fallback name)
     pub(crate) fp_kind: BTreeSet<String>,
-    pub(crate) out_kind: BTreeSet<&'static str>,
+    pub(crate) codegen: bool, // has a codegen output (not only `rmeta`: a `check` build)
     pub(crate) has_fingerprint: bool,
     pub(crate) rustc: u64,   // hash of `rustc -vV` (differs between toolchains)
     pub(crate) sig: String, // fingerprint json minus deps/local/path: features, profile, rustflags, ...
@@ -35,11 +35,10 @@ impl Unit {
     pub(crate) fn group(&self) -> String {
         let name = self.name.as_deref().unwrap_or(&self.stem);
         let fp: Vec<&str> = self.fp_kind.iter().map(String::as_str).collect();
-        let out: Vec<&str> = self.out_kind.iter().copied().collect();
         format!(
             "{name}|{}|{}|{}|{}|{}|{}",
             fp.join(","),
-            out.join(","),
+            self.codegen,
             self.rustc,
             self.tag,
             self.home,
@@ -163,8 +162,8 @@ pub(crate) fn scan(
             if u.stem.is_empty() {
                 u.stem = stem.to_owned();
             }
-            if let Some(k) = out_kind(rest, e.is_dir) {
-                u.out_kind.insert(k);
+            if is_codegen(rest.trim_start_matches('.')) {
+                u.codegen = true;
             }
             if rest == ".rmeta" || rest.ends_with(".rcgu.o") {
                 u.inodes.extend(e.ino);
@@ -175,6 +174,11 @@ pub(crate) fn scan(
             }
             u.paths.push(e.path);
         }
+    }
+    // a unit not dated yet (an orphan; one stat each, they are few) is dated by its dep-info, so
+    // it claims the incremental dir of the interrupted session that wrote it
+    for u in units.values_mut().filter(|u| u.mtime.is_none()) {
+        u.mtime = u.dep_info.as_deref().and_then(mtime);
     }
     // new build-dir layout (cargo 1.100+): build/<pkg>/<hash>/{fingerprint,out,run}, one dir per
     // unit. A hash also present in the legacy layout above is then a dead copy of the old layout.
@@ -202,14 +206,9 @@ pub(crate) fn scan(
             u.stem = pkg.name.clone();
             for f in entries(&e.path.join("out")) {
                 let rest = f.name.split_once('.').map_or("", |(_, r)| r);
-                let kind = match rest {
-                    "" if !f.is_dir => Some("bin"),
-                    "rlib" | "rmeta" | "dylib" | "so" | "dll" | "a" | "lib" | "exe" | "wasm" => {
-                        out_kind(&format!(".{rest}"), f.is_dir)
-                    }
-                    _ => None,
-                };
-                u.out_kind.extend(kind);
+                if is_codegen(rest) {
+                    u.codegen = true;
+                }
                 if rest == "rmeta" || f.name.ends_with(".rcgu.o") {
                     u.inodes.extend(f.ino);
                 }
@@ -258,19 +257,4 @@ pub(crate) fn scan(
     });
     ph.mark("scan incremental");
     (units, incremental)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_start_decodes_rustc_names() {
-        let t = session_start("s-ho1077drys-0o8e2xo-8bdb6vc1lqjdqqtb962q6qng5").unwrap();
-        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        assert!((1_790_000_000..1_800_000_000).contains(&secs), "{secs}"); // November 2026
-        assert!(session_start("s-ho1077drys-0o8e2xo.lock").is_some());
-        assert_eq!(session_start("not-a-session"), None);
-        assert_eq!(session_start("s-x"), None);
-    }
 }

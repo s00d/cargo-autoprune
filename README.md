@@ -88,7 +88,7 @@ after your steps):
     key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
     restore-keys: cargo-${{ runner.os }}-
 - run: cargo test
-- uses: s00d/cargo-autoprune@0.1.1  # = cargo autoprune --ci .
+- uses: s00d/cargo-autoprune@0.1.2  # = cargo autoprune --ci .
   with:
     max-size: 4G                    # optional
 ```

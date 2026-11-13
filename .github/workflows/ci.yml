@@ -28,7 +28,7 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test -- --include-ignored
+      - run: cargo test --no-fail-fast -- --include-ignored
         timeout-minutes: 15
         env:
           RUST_BACKTRACE: "1"

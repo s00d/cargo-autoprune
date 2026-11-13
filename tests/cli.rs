@@ -97,12 +97,14 @@ fn dry_run_then_prune() {
     let dir = p(&s.root);
     let dry = bin(&s, &["-n", dir], &[], &s.root);
     assert_eq!(dry.code, 0, "{}", dry.err);
+    // the paths it would delete: indented absolute paths (`/…` or `D:\…`)
     let listed: Vec<&str> = dry
         .out
         .lines()
-        .filter_map(|l| l.strip_prefix("  /"))
+        .filter_map(|l| l.strip_prefix("  "))
+        .filter(|l| Path::new(l).is_absolute())
         .collect();
-    assert!(!listed.is_empty() && listed.iter().all(|l| Path::new(&format!("/{l}")).exists()));
+    assert!(!listed.is_empty() && listed.iter().all(|l| Path::new(l).exists()));
     assert!(
         dry.out
             .contains(": would remove 2 units, 2 incremental dirs, "),
@@ -306,7 +308,7 @@ fn status_reports_the_setup_and_the_target() {
         );
     }
 
-    let home_cfg = s.root.join("home/.cargo/config.toml");
+    let home_cfg = s.root.join("home").join(".cargo").join("config.toml"); // `\` on Windows
     for (text, on) in [
         ("[build]\nrustc-wrapper = \"cargo-autoprune\"\n", true),
         ("  # rustc-wrapper = \"cargo-autoprune\"\n", false),
@@ -482,7 +484,7 @@ fn server_mode_finds_targets_and_removes_idle_ones() {
     let busy_prof = busy.prof.clone();
     // the wrapper renewed its stamp today
     fs::write(busy_prof.join(".autoprune/stamp"), "").unwrap();
-    let work_idle = work.join("idle/target");
+    let work_idle = work.join("idle").join("target"); // as printed: `\` on Windows
     let r = |args: &[&str]| bin(&idle, args, &[], &root);
     let dry = r(&["-r", "--remove-idle", "30", "-n", p(&root)]);
     assert!(
